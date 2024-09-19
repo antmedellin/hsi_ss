@@ -107,9 +107,9 @@ class mmsegyrebDataset(Dataset):
         sar_img = tiff.imread(sar_path)
         sar_img_np = np.array(sar_img) # int16 x,y,channels=2
         
-        # Add a third channel of zeros to the SAR image
-        zeros_channel = np.zeros((sar_img_np.shape[0], sar_img_np.shape[1]), dtype=sar_img_np.dtype)
-        sar_img_np = np.dstack((sar_img_np, zeros_channel)) # Now sar_img_np has shape (x, y, 3)
+        # # Add a third channel of zeros to the SAR image # used in cases where 3 channel rgb models are used
+        # zeros_channel = np.zeros((sar_img_np.shape[0], sar_img_np.shape[1]), dtype=sar_img_np.dtype)
+        # sar_img_np = np.dstack((sar_img_np, zeros_channel)) # Now sar_img_np has shape (x, y, 3)
         
         # stack the msi and sar images
         msi_img_np = np.dstack((msi_img_np, sar_img_np)) # Now sar_img_np has shape (x, y, 14)
