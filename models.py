@@ -22,29 +22,64 @@ from torchvision.transforms import Resize
 import tifffile as tiff
 import os
 import sys
+from crfrnn import CrfRnn
 
+from scipy.ndimage import distance_transform_edt
 
+class BoundaryLoss(nn.Module):
+    def __init__(self, weight=1.0):
+        super(BoundaryLoss, self).__init__()
+        self.weight = weight
+
+    def forward(self, logits, targets):
+        # Convert logits to probabilities
+        probs = F.softmax(logits, dim=1)
+        
+        # Get the predicted class for each pixel
+        preds = torch.argmax(probs, dim=1)
+        
+        # Compute the distance transform for the ground truth
+        dist_maps = self.compute_distance_transform(targets)
+        
+        # Compute the boundary loss
+        boundary_loss = torch.mean(dist_maps * (preds != targets).float())
+        
+        return self.weight * boundary_loss
+
+    def compute_distance_transform(self, targets):
+        dist_maps = torch.zeros_like(targets, dtype=torch.float32)
+        for b in range(targets.shape[0]):
+            for c in range(targets.shape[1]):
+                target = targets[b, c].cpu().numpy()
+                dist_map = distance_transform_edt(target == 0)
+                dist_maps[b, c] = torch.tensor(dist_map, device=targets.device)
+        return dist_maps
 
 class CombinedLoss(nn.Module):
     def __init__(self, ignore_index=0):
         super(CombinedLoss, self).__init__()
         self.cross_entropy_loss =  nn.CrossEntropyLoss(ignore_index=ignore_index)
         # self.focal_loss = FocalLoss(mode="multiclass", ignore_index=ignore_index)
-        # self.JaccardLoss = JaccardLoss(mode="multiclass") # focuses on the iou metric, range 0-1
+        self.JaccardLoss = JaccardLoss(mode="multiclass") # focuses on the iou metric, range 0-1
         self.LovaszLoss = LovaszLoss(mode="multiclass", ignore_index=ignore_index) # focuses on the iou metric, range 0-1
         self.DiceLoss = DiceLoss(mode="multiclass", ignore_index=ignore_index) # focuses on the iou metric, range 0-1
         # add f1 score based loss function 
         # https://www.kaggle.com/code/rejpalcz/best-loss-function-for-f1-score-metric 
         # https://smp.readthedocs.io/en/latest/losses.html 
-     
+        # self.BoundaryLoss = BoundaryLoss(weight=1.0)
+
 
     def forward(self, logits, targets):
         # focal_loss = self.focal_loss(logits, targets)
-        # jaccard_loss = self.JaccardLoss(logits, targets)
+        jaccard_loss = self.JaccardLoss(logits, targets)
         lovasz_loss = self.LovaszLoss(logits, targets)
         dice_loss = self.DiceLoss(logits, targets)
         ce_loss = self.cross_entropy_loss(logits, targets)
-        return   0.5* ce_loss +  dice_loss + 3 * lovasz_loss # scale iou loss since it is smaller than focal loss
+        # boundary_loss = self.BoundaryLoss(logits, targets)
+
+        return   1 * ce_loss +   2 * dice_loss + 3 * lovasz_loss + 3 * jaccard_loss #+ 1 * boundary_loss
+        
+        # scale iou loss since it is smaller than focal loss
 
 def collate_fn(inputs):
 
@@ -240,16 +275,35 @@ class BaseSegmentationModel(L.LightningModule):
         
         def configure_optimizers(self):
             optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.learning_rate)
+            
+            
             # return optimizer
             # scheduler = lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20)
-            scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
+            # scheduler = lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1, eta_min=1e-6)
+
+            # scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
+            
+            # Learning rate warmup scheduler for a warmup period of 5 epochs
+            def lr_lambda(epoch):
+                if epoch < 5:
+                    return float(epoch) / 5
+                return 1.0
+
+            warmup_scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda)
+            
+            # Cosine annealing warm restarts scheduler
+            cosine_scheduler = lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1, eta_min=1e-6)
+            
+            # Combine the warmup and cosine annealing schedulers
+            scheduler = lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[5])
+        
 
             return {
             'optimizer': optimizer,
             # "lr_scheduler": scheduler
             'lr_scheduler': {
                 'scheduler': scheduler,
-                'monitor': 'train_miou',  # Metric to monitor for learning rate adjustment
+                'monitor': 'train_loss',  # Metric to monitor for learning rate adjustment
                 'interval': 'epoch',    # How often to apply the scheduler
                 'frequency': 1          # Frequency of the scheduler
             }
@@ -277,13 +331,50 @@ class SMP_SemanticSegmentation(BaseSegmentationModel):
         # self.hsi_unet = smp.PSPNet('resnet152', in_channels=self.num_channels, classes=self.num_classes, encoder_depth=5, upsampling=32)
         # self.hsi_unet = smp.PAN('resnet152', in_channels=self.num_channels, classes=self.num_classes) # batch size 16 
         #Unet, Linknet, FPN, PSPNet, PAN
+        self.crfrnn = CrfRnn(num_labels=self.num_classes, num_iterations=10)
 
     def forward(self, msi_img, sar_img):
             
             x = self.msi_unet(msi_img)
             
-            return x
+            y = self.crfrnn(msi_img, x)
+            
+            return y
+
+
+class SMP_Channel_SemanticSegmentation(BaseSegmentationModel):
+    def __init__(self, num_classes, learning_rate=1e-3, ignore_index=0, num_channels=12, num_workers=4, train_dataset=None, val_dataset=None, test_dataset=None, batch_size=2):
+        super().__init__(num_classes, learning_rate, ignore_index, num_channels, num_workers, train_dataset, val_dataset, test_dataset, batch_size)
         
+        # can replace with models from segmentation_models_pytorch
+        # refernce: https://segmentation-modelspytorch.readthedocs.io/en/latest/#models 
+        # self.msi_smp = smp.FPN('resnet152', in_channels=self.num_channels, classes=self.num_classes, encoder_depth=5)
+        # self.hsi_unet = smp.PSPNet('resnet152', in_channels=self.num_channels, classes=self.num_classes, encoder_depth=5, upsampling=32)
+        # self.hsi_unet = smp.PAN('resnet152', in_channels=self.num_channels, classes=self.num_classes) # batch size 16 
+        #Unet, Linknet, FPN, PSPNet, PAN
+        
+        # Initialize separate  models for each channel
+        self.fpn_models = nn.ModuleList([
+            smp.FPN('resnet152', in_channels=1, classes=self.num_classes, encoder_depth=5)
+            for _ in range(self.num_channels)
+        ])
+
+    def forward(self, msi_img, sar_img):
+            
+        # x = self.msi_smp(msi_img)
+            
+        # return x        
+        # Split the input image into separate channels
+        channel_outputs = []
+        for i in range(self.num_channels):
+            channel_img = msi_img[:, i:i+1, :, :]  # Extract the i-th channel
+            channel_output = self.fpn_models[i](channel_img)
+            channel_outputs.append(channel_output)
+        
+        # Fuse the results from each channel (e.g., by summing)
+        fused_output = torch.stack(channel_outputs, dim=0).sum(dim=0)
+        
+        return fused_output
  
 class DINOv2_SemanticSegmentation(BaseSegmentationModel):
     def __init__(self, num_classes, learning_rate=1e-3, ignore_index=0, num_channels=204, num_workers=4, train_dataset=None, val_dataset=None, test_dataset=None, batch_size=2, repo_name="facebookresearch/dinov2", model_name="dinov2_vitb14_reg", half_precision=False , tokenW=32, tokenH=32 ):

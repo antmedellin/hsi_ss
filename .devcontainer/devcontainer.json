@@ -3,7 +3,8 @@
     "image" : "hsi_ss",
 
     "mounts":[
-        "source=${localWorkspaceFolder}/../MMSeg-YREB,target=/workspaces/MMSeg-YREB,type=bind,consistency=cached",
+        // "source=${localWorkspaceFolder}/../MMSeg-YREB,target=/workspaces/MMSeg-YREB,type=bind,consistency=cached",
+        "source=${localWorkspaceFolder}/../HyperImages/hsi_ss/MMSeg-YREB,target=/workspaces/MMSeg-YREB,type=bind,consistency=cached",
     ],
 
     "runArgs":[
@@ -33,3 +34,7 @@
 
 
 }
+
+
+
+//  /workspaces/hsi_ss/crfasrnn$ sudo  python3 setup.py install running install

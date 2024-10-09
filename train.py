@@ -34,7 +34,7 @@ builtins.print = functools.partial(print, flush=True)
 import segmentation_models_pytorch as smp
 from segmentation_models_pytorch.losses import JaccardLoss
 import models
-from models import SMP_SemanticSegmentation, DINOv2_SemanticSegmentation
+from models import SMP_SemanticSegmentation, DINOv2_SemanticSegmentation, SMP_Channel_SemanticSegmentation
 import tifffile as tiff
 from torchvision.transforms import Resize
 
@@ -149,14 +149,44 @@ class mmsegyrebDataset(Dataset):
 
             
         return msi_img, sar_img, label_img, self.img_names_msi[idx]   
+
+
+def compute_dataset_statistics(dataset, num_channels):
+    # Initialize accumulators
+    channel_sum = torch.zeros(num_channels)
+    channel_sum_squared = torch.zeros(num_channels)
+    channel_min = torch.full((num_channels,), float('inf'))
+    channel_max = torch.full((num_channels,), float('-inf'))
+    pixel_count = 0
+
+    # Create DataLoader
+    # dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4)
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=models.collate_fn,num_workers=8)
+
+    for batch in dataloader:
+        images = batch['msi_pixel_values']  # Assuming the dataset returns a dictionary with 'image' key
+        images = images.view(images.size(0), images.size(1), -1)  # Flatten the spatial dimensions
+        pixel_count += images.size(2)
+
+        # Update accumulators
+        channel_sum += images.sum(dim=2).sum(dim=0)
+        channel_sum_squared += (images ** 2).sum(dim=2).sum(dim=0)
+        channel_min = torch.min(channel_min, images.min(dim=2)[0].min(dim=0)[0])
+        channel_max = torch.max(channel_max, images.max(dim=2)[0].max(dim=0)[0])
+
+    # Compute mean and std
+    channel_mean = channel_sum / pixel_count
+    channel_std = torch.sqrt(channel_sum_squared / pixel_count - channel_mean ** 2)
+
+    return channel_min, channel_max, channel_mean, channel_std
     
 
 dataset_dir='/workspaces/MMSeg-YREB'
 # 9 LULC classes are: 0) Background, 1) Tree, 2) Grassland, 3) Cropland, 4) Low Vegetation, 5) Wetland, 6) Water, 7) Built-up, 8) Bare ground, 9) Snow.
 num_classes = 10 # ignore 0 background 
-batch_size = 16
+batch_size = 32
 ignore_index=0 # background
-num_workers = 16 #  os.cpu_count() or 1  # Fallback to 1 if os.cpu_count() is None
+num_workers = 4 #  os.cpu_count() or 1  # Fallback to 1 if os.cpu_count() is None
 initial_lr =  0.001 
 swa_lr = 0.01
 # these should be multiple of 14 for dino model 
@@ -164,8 +194,8 @@ swa_lr = 0.01
 img_height = 256
 img_width = 256
 max_num_epochs = 100
-accumulate_grad_batches = 1 # increases the effective batch size  # 1 means no accumulation # more important when batch size is small or not doing multi gpu training
-grad_clip_val = 5 # clip gradients that have norm bigger than this
+accumulate_grad_batches = 2 # increases the effective batch size  # 1 means no accumulation # more important when batch size is small or not doing multi gpu training
+grad_clip_val = 5 # clip gradients that have norm bigger than tmax_val)his
 training_model = True
 tuning_model = False
 test_model = False
@@ -174,32 +204,67 @@ test_model = False
 # Define mean and standard deviation for normalization
 # Use the same value for all channels
 num_channels = 14
-mean = [0.45] * num_channels  
-std = [0.225] * num_channels   
+# mean = [0.45] * num_channels  
+# std = [0.225] * num_channels   
+
+
+mean = [1368.6125, 1159.3759, 1066.2174, 1000.4777, 1233.8301, 1868.6222, 2124.8076, 2111.7993, 2322.8552, 1078.5980, 1715.7476, 1081.0111, -1487.6545, -803.5430]
+std = [491.7540, 544.0209, 557.4269, 675.8509, 660.5626, 602.1366, 635.2303, 644.9349, 678.6457, 557.9268, 665.9048, 528.2560, 430.0971, 362.5961]
+
+min_val = [688., 467., 294., 173., 173., 196., 188., 177., 181., 82., 61., 30., -7992., -7478.]
+max_val = [11824., 13134., 13005., 14074., 13930., 13746., 14287., 15032., 14416., 9006., 11881., 11510., 5699., 6385.]
+
+
+# Channel Min: tensor([  688.,   467.,   294.,   173.,   173.,   196.,   188.,   177.,   181.,
+#            82.,    61.,    30., -7992., -7478.])
+
+# Channel Max: tensor([11824., 13134., 13005., 14074., 13930., 13746., 14287., 15032., 14416.,
+#          9006., 11881., 11510.,  5699.,  6385.])
+
+# Channel Mean: tensor([ 1368.6125,  1159.3759,  1066.2174,  1000.4777,  1233.8301,  1868.6222,
+#          2124.8076,  2111.7993,  2322.8552,  1078.5980,  1715.7476,  1081.0111,
+#         -1487.6545,  -803.5430])
+
+# Channel Std: tensor([491.7540, 544.0209, 557.4269, 675.8509, 660.5626, 602.1366, 635.2303,
+#         644.9349, 678.6457, 557.9268, 665.9048, 528.2560, 430.0971, 362.5961])
+
+
 
 torch.cuda.empty_cache()
 
 test_transform = A.Compose([
     A.Resize(width=img_width, height=img_height), 
-    A.Normalize(mean=mean, std=std, max_pixel_value=255.0)
-
+    A.Normalize(mean=mean, std=std, normalization="image_per_channel", max_pixel_value=15032)
 ], additional_targets={"msi_image": "image"})
 
 train_transform = A.Compose([
     A.HorizontalFlip(p=0.5),
     A.VerticalFlip(p=0.5),
     A.RandomRotate90(p=0.5),
+    A.GaussianBlur(blur_limit=(3, 7), p=0.5),
+    A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.5),
+    A.RandomScale(scale_limit=0.2, p=0.5),
+    A.ElasticTransform(alpha=1, sigma=50, alpha_affine=None, p=0.5),  # Set alpha_affine to None
     A.Resize(width=img_width, height=img_height), 
-    A.Normalize(mean=mean, std=std, max_pixel_value=255.0)
+    A.Normalize(mean=mean, std=std, normalization="image", max_pixel_value=15032)
 ], additional_targets={"msi_image": "image"})
 
 
 train_dataset = mmsegyrebDataset(image_set="train", root_dir=dataset_dir,  transform=train_transform)
 
 
+# channel_min, channel_max, channel_mean, channel_std = compute_dataset_statistics(train_dataset, num_channels)
+
+# print("Channel Min:", channel_min)
+# print("Channel Max:", channel_max)
+# print("Channel Mean:", channel_mean)
+# print("Channel Std:", channel_std)
+# sys.exit()
+
 model = SMP_SemanticSegmentation(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, batch_size=batch_size)
 # model = DINOv2_SemanticSegmentation(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset,  batch_size=batch_size)
-
+# model = SMP_Channel_SemanticSegmentation(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, batch_size=batch_size)
+model = SMP_SemanticSegmentation.load_from_checkpoint("lightning_logs/version_16/checkpoints/lowest_train_loss_hsi.ckpt")
 
 checkpoint_callback_train_loss = ModelCheckpoint(monitor="train_loss", mode="min", save_top_k=1, filename="lowest_train_loss_hsi")
 checkpoint_callback_train_miou = ModelCheckpoint(monitor="train_miou", mode="max", save_top_k=1, filename="best_train_miou_hsi")
