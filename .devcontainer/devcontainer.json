@@ -38,3 +38,4 @@
 
 
 //  /workspaces/hsi_ss/crfasrnn$ sudo  python3 setup.py install running install
+// pip install einops

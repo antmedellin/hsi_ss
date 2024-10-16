@@ -25,6 +25,13 @@ import sys
 from crfrnn import CrfRnn
 
 from scipy.ndimage import distance_transform_edt
+from rotary import RotaryEmbedding
+from rotary import apply_rotary_emb
+from local_attention import LocalAttention
+from flash_attn import flash_attn_func
+#  pip install local-attention
+# pip install flash-attn --no-build-isolation
+# https://github.com/xiayuqing0622/customized-flash-attention 
 
 class BoundaryLoss(nn.Module):
     def __init__(self, weight=1.0):
@@ -331,15 +338,13 @@ class SMP_SemanticSegmentation(BaseSegmentationModel):
         # self.hsi_unet = smp.PSPNet('resnet152', in_channels=self.num_channels, classes=self.num_classes, encoder_depth=5, upsampling=32)
         # self.hsi_unet = smp.PAN('resnet152', in_channels=self.num_channels, classes=self.num_classes) # batch size 16 
         #Unet, Linknet, FPN, PSPNet, PAN
-        self.crfrnn = CrfRnn(num_labels=self.num_classes, num_iterations=10)
 
     def forward(self, msi_img, sar_img):
             
             x = self.msi_unet(msi_img)
             
-            y = self.crfrnn(msi_img, x)
             
-            return y
+            return x
 
 
 class SMP_Channel_SemanticSegmentation(BaseSegmentationModel):
@@ -355,9 +360,13 @@ class SMP_Channel_SemanticSegmentation(BaseSegmentationModel):
         
         # Initialize separate  models for each channel
         self.fpn_models = nn.ModuleList([
-            smp.FPN('resnet152', in_channels=1, classes=self.num_classes, encoder_depth=5)
+            smp.FPN('resnet34', in_channels=1, classes=self.num_classes, encoder_depth=5)
             for _ in range(self.num_channels)
         ])
+        
+        # Learnable fusion layer
+        self.fusion_layer = nn.Conv2d(self.num_channels * self.num_classes, self.num_classes, kernel_size=1)
+
 
     def forward(self, msi_img, sar_img):
             
@@ -372,7 +381,14 @@ class SMP_Channel_SemanticSegmentation(BaseSegmentationModel):
             channel_outputs.append(channel_output)
         
         # Fuse the results from each channel (e.g., by summing)
-        fused_output = torch.stack(channel_outputs, dim=0).sum(dim=0)
+        # fused_output = torch.stack(channel_outputs, dim=0).sum(dim=0)
+        
+        # Concatenate the results from each channel
+        concatenated_output = torch.cat(channel_outputs, dim=1)  # Concatenate along the channel dimension
+        
+        # Apply the learnable fusion layer
+        fused_output = self.fusion_layer(concatenated_output)
+        
         
         return fused_output
  
@@ -420,3 +436,607 @@ class DINOv2_SemanticSegmentation(BaseSegmentationModel):
             
             return logits     
 
+
+#reference  https://lightning.ai/docs/pytorch/stable/notebooks/course_UvA-DL/11-vision-transformer.html 
+def img_to_patch(x, patch_size, flatten_channels=True):
+    """
+    Args:
+        x: Tensor representing the image of shape [B, C, H, W]
+        patch_size: Number of pixels per dimension of the patches (integer)
+        flatten_channels: If True, the patches will be returned in a flattened format
+                           as a feature vector instead of a image grid.
+    """
+    B, C, H, W = x.shape
+    x = x.reshape(B, C, H // patch_size, patch_size, W // patch_size, patch_size)
+    x = x.permute(0, 2, 4, 1, 3, 5)  # [B, H', W', C, p_H, p_W]
+    x = x.flatten(1, 2)  # [B, H'*W', C, p_H, p_W]
+    if flatten_channels:
+        x = x.flatten(2, 4)  # [B, H'*W', C*p_H*p_W]
+    return x
+
+#usage for above
+# img_patches = img_to_patch(mages, patch_size=4, flatten_channels=False)
+
+class AttentionBlock(nn.Module):
+    def __init__(self, embed_dim, hidden_dim, num_heads, dropout=0.0):
+        """Attention Block. pre- layer norm
+
+        Args:
+            embed_dim: Dimensionality of input and attention feature vectors
+            hidden_dim: Dimensionality of hidden layer in feed-forward network
+                         (usually 2-4x larger than embed_dim)
+            num_heads: Number of heads to use in the Multi-Head Attention block
+            dropout: Amount of dropout to apply in the feed-forward network
+
+        """
+        super().__init__()
+
+        self.layer_norm_1 = nn.LayerNorm(embed_dim)
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads)
+        self.layer_norm_2 = nn.LayerNorm(embed_dim)
+        self.linear = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, embed_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        inp_x = self.layer_norm_1(x)
+        x = x + self.attn(inp_x, inp_x, inp_x)[0]
+        x = x + self.linear(self.layer_norm_2(x))
+        return x
+
+class LocalAttentionBlock(nn.Module):
+    def __init__(self, embed_dim, hidden_dim, num_heads, window_size, dropout=0.1):
+        super(LocalAttentionBlock, self).__init__()
+        self.window_size = window_size
+        self.attention = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, embed_dim),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        windows = x.unfold(1, self.window_size, self.window_size).permute(0, 2, 1, 3).contiguous()
+        windows = windows.view(-1, self.window_size, C)
+        
+        attn_output, _ = self.attention(windows, windows, windows)
+        attn_output = attn_output.view(B, -1, C)
+        
+        x = x + self.dropout(attn_output)
+        x = self.norm1(x)
+        
+        ffn_output = self.ffn(x)
+        x = x + self.dropout(ffn_output)
+        x = self.norm2(x)
+        
+        return x
+
+# referemce https://github.com/microsoft/unilm/blob/master/Diff-Transformer/multihead_diffattn.py 
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """torch.repeat_interleave(x, dim=1, repeats=n_rep)"""
+    bs, n_kv_heads, slen, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        x[:, :, None, :, :]
+        .expand(bs, n_kv_heads, n_rep, slen, head_dim)
+        .reshape(bs, n_kv_heads * n_rep, slen, head_dim)
+    )
+
+def lambda_init_fn(depth):
+    return 0.8 - 0.6 * math.exp(-0.3 * depth)
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6, elementwise_affine=True, memory_efficient=False):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        if self.elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(dim))
+        else:
+            self.register_parameter('weight', None)
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x.float()).type_as(x)
+        if self.weight is not None:
+            output = output * self.weight
+        return output
+
+    def extra_repr(self) -> str:
+        return f'dim={self.dim}, eps={self.eps}, elementwise_affine={self.elementwise_affine}'
+    
+class MultiheadDiffAttn(nn.Module):
+    def __init__(
+        self,
+        embed_dim,
+        depth,
+        num_heads,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        # num_heads set to half of Transformer's #heads
+        self.num_heads = num_heads 
+        self.num_kv_heads = 4#num_heads 
+        self.n_rep = self.num_heads // self.num_kv_heads
+        
+        self.head_dim = embed_dim // num_heads // 2
+        self.scaling = self.head_dim ** -0.5
+        
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.k_proj = nn.Linear(embed_dim, embed_dim // self.n_rep, bias=False)
+        self.v_proj = nn.Linear(embed_dim, embed_dim // self.n_rep, bias=False)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+
+        self.lambda_init = lambda_init_fn(depth)
+        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+
+        self.subln = RMSNorm(2 * self.head_dim, eps=1e-5, elementwise_affine=False)
+    
+    def forward(
+        self,
+        x,
+        rel_pos,
+        attn_mask=None,
+    ):
+        bsz, tgt_len, embed_dim = x.size()
+        src_len = tgt_len
+
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        q = q.view(bsz, tgt_len, 2 * self.num_heads, self.head_dim)
+        k = k.view(bsz, src_len, 2 * self.num_kv_heads, self.head_dim)
+        v = v.view(bsz, src_len, self.num_kv_heads, 2 * self.head_dim)
+
+        q = apply_rotary_emb(q, *rel_pos, interleaved=True)
+        k = apply_rotary_emb(k, *rel_pos, interleaved=True)
+
+        q = q.transpose(1, 2)
+        
+        k = torch.repeat_interleave(k.transpose(1, 2), dim=1, repeats=self.n_rep)
+        v = torch.repeat_interleave(v.transpose(1, 2), dim=1, repeats=self.n_rep * 2)
+        if attn_mask is None:
+            attn_mask = torch.triu(
+                torch.zeros([tgt_len, src_len])
+                .float()
+                .fill_(float("-inf"))
+                .type_as(q),
+                1 + src_len - tgt_len,
+            )
+
+        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(q)
+        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(q)
+        lambda_full = lambda_1 - lambda_2 + self.lambda_init
+
+        attn_weights = F.scaled_dot_product_attention(query=q, key=k, value=v, attn_mask=attn_mask, scale=self.scaling)
+        every_other_mask = torch.arange(attn_weights.size(1)) % 2 == 0
+        attn = attn_weights[:, every_other_mask, :, :] - lambda_full * attn_weights[:, ~every_other_mask, :, :]
+
+        attn = self.subln(attn)
+        attn = attn * (1 - self.lambda_init)
+        attn = attn.transpose(1, 2).reshape(bsz, tgt_len, self.num_heads * 2 * self.head_dim)
+
+        attn = self.out_proj(attn)
+        return attn
+
+    def forward2( #origianal
+            self,
+            x,
+            rel_pos,
+            attn_mask=None,
+        ):
+            bsz, tgt_len, embed_dim = x.size()
+            src_len = tgt_len
+
+            q = self.q_proj(x)
+            k = self.k_proj(x)
+            v = self.v_proj(x)
+
+            q = q.view(bsz, tgt_len, 2 * self.num_heads, self.head_dim)
+            k = k.view(bsz, src_len, 2 * self.num_kv_heads, self.head_dim)
+            v = v.view(bsz, src_len, self.num_kv_heads, 2 * self.head_dim)
+
+            q = apply_rotary_emb(q, *rel_pos, interleaved=True)
+            k = apply_rotary_emb(k, *rel_pos, interleaved=True)
+
+            offset = src_len - tgt_len
+            q = q.transpose(1, 2)
+            k = repeat_kv(k.transpose(1, 2), self.n_rep)
+            v = repeat_kv(v.transpose(1, 2), self.n_rep)
+            q *= self.scaling
+            attn_weights = torch.matmul(q, k.transpose(-1, -2))
+            if attn_mask is None:
+                attn_mask = torch.triu(
+                    torch.zeros([tgt_len, src_len])
+                    .float()
+                    .fill_(float("-inf"))
+                    .type_as(attn_weights),
+                    1 + offset,
+                )
+            attn_weights = torch.nan_to_num(attn_weights)
+            attn_weights += attn_mask   
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).type_as(
+                attn_weights
+            )
+
+            lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(q)
+            lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(q)
+            lambda_full = lambda_1 - lambda_2 + self.lambda_init
+            attn_weights = attn_weights.view(bsz, self.num_heads, 2, tgt_len, src_len)
+            attn_weights = attn_weights[:, :, 0] - lambda_full * attn_weights[:, :, 1]
+            
+            attn = torch.matmul(attn_weights, v)
+            attn = self.subln(attn)
+            attn = attn * (1 - self.lambda_init)
+            attn = attn.transpose(1, 2).reshape(bsz, tgt_len, self.num_heads * 2 * self.head_dim)
+
+            attn = self.out_proj(attn)
+            return attn
+
+
+class MultiheadFlashDiff1(nn.Module):
+    """
+    (Recommended)
+    DiffAttn implemented with FlashAttention, for packages that support different qk/v dimensions
+    e.g., our customized-flash-attention (https://aka.ms/flash-diff) and xformers (https://github.com/facebookresearch/xformers)
+    """
+    def __init__(
+        self,
+        embed_dim,
+        depth,
+        num_heads,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        # num_heads set to half of Transformer's #heads
+        self.num_heads = num_heads 
+        self.num_kv_heads =  4#num_heads 
+        self.n_rep = self.num_heads // self.num_kv_heads
+        
+        self.head_dim = embed_dim // num_heads // 2
+        self.scaling = self.head_dim ** -0.5
+        
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.k_proj = nn.Linear(embed_dim, embed_dim // self.n_rep, bias=False)
+        self.v_proj = nn.Linear(embed_dim, embed_dim // self.n_rep, bias=False)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+
+        self.lambda_init = lambda_init_fn(depth)
+        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+
+        self.subln = RMSNorm(2 * self.head_dim, eps=1e-5, elementwise_affine=False)
+    
+    def forward(
+        self,
+        x,
+        rel_pos,
+        attn_mask=None,
+    ):
+        bsz, tgt_len, embed_dim = x.size()
+        src_len = tgt_len
+
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        q = q.view(bsz, tgt_len, 2 * self.num_heads, self.head_dim)
+        k = k.view(bsz, src_len, 2 * self.num_kv_heads, self.head_dim)
+        v = v.view(bsz, src_len, self.num_kv_heads, 2 * self.head_dim)
+
+        q = apply_rotary_emb(q, *rel_pos, interleaved=True)
+        k = apply_rotary_emb(k, *rel_pos, interleaved=True)
+
+        offset = src_len - tgt_len
+        q = q.reshape(bsz, tgt_len, self.num_heads, 2, self.head_dim)
+        k = k.reshape(bsz, src_len, self.num_kv_heads, 2, self.head_dim)
+        q1, q2 = q[:, :, :, 0], q[:, :, :, 1]
+        k1, k2 = k[:, :, :, 0], k[:, :, :, 1]
+        
+        print("v shape", v.shape, "batch size", bsz, "seqlen_k", src_len, "num_kv_heads", self.num_kv_heads, "head_dim", self.head_dim)
+        
+        attn1 = flash_attn_func(q1, k1, v, causal=True)
+        attn2 = flash_attn_func(q2, k2, v, causal=True)
+        
+        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(q)
+        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(q)
+        lambda_full = lambda_1 - lambda_2 + self.lambda_init
+        attn = attn1 - lambda_full * attn2
+
+        attn = self.subln(attn)
+        attn = attn * (1 - self.lambda_init)
+        attn = attn.reshape(bsz, tgt_len, self.num_heads * 2 * self.head_dim)
+        
+        attn = self.out_proj(attn)
+        return attn
+    
+    
+class DiffVisionTransformer(BaseSegmentationModel):
+    def __init__(self, num_classes, learning_rate=1e-3, ignore_index=0, num_channels=12, num_workers=4, train_dataset=None, val_dataset=None, test_dataset=None, batch_size=2, embed_dim=256, num_heads=8, num_layers=8, patch_size=8, dropout=0, num_registers=4):
+
+        
+        super().__init__(num_classes, learning_rate, ignore_index, num_channels, num_workers, train_dataset, val_dataset, test_dataset, batch_size)
+        
+        self.patch_size = patch_size
+        self.num_registers = num_registers
+        num_patches = (256 // patch_size) ** 2 # 256 is the image size
+        self.num_patches = num_patches
+
+        # Layers/Networks
+        self.input_layer = nn.Linear(self.num_channels * (patch_size**2), embed_dim)
+        
+        self.head_dim = embed_dim // (num_heads * 2)
+              
+        # diff transformer
+        # self.transformer = MultiheadDiffAttn(embed_dim, num_layers, num_heads)
+        self.transformer = MultiheadFlashDiff1(embed_dim, num_layers, num_heads)
+        
+        num_new_heads = num_heads * 2
+        head_dim = embed_dim // num_new_heads
+        self.rotary_emb = RotaryEmbedding(
+            head_dim,
+            base=10000.0,
+            interleaved=True,
+            device=self.device,
+        )
+        self.seq_len = 1 + self.num_patches + self.num_registers
+        
+        self.segmentation_head = nn.Conv2d(embed_dim, self.num_classes , kernel_size=1)
+        self.dropout = nn.Dropout(dropout)
+
+        # Parameters/Embeddings
+        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
+        self.pos_embedding = nn.Parameter(torch.randn(1, 1 + self.num_patches + num_registers , embed_dim))
+        self.registers = nn.Parameter(torch.randn(1, num_registers, embed_dim))
+
+    def forward(self, msi_img, sar_img):
+        # Preprocess input
+        x = img_to_patch(msi_img, self.patch_size)
+        B, T, _ = x.shape
+        x = self.input_layer(x)
+
+        # Add CLS token and positional encoding
+        cls_token = self.cls_token.repeat(B, 1, 1)
+        registers = self.registers.repeat(B, 1, 1)
+        x = torch.cat([cls_token, registers, x], dim=1)
+        x = x + self.pos_embedding[:, : T + 1 + self.num_registers]
+
+        # Apply Transforrmer
+        x = self.dropout(x)
+        x = x.transpose(0, 1)
+        
+        
+
+        self.rotary_emb._update_cos_sin_cache(self.seq_len, device=self.device, dtype=torch.bfloat16)
+        rel_pos = (self.rotary_emb._cos_cached, self.rotary_emb._sin_cached)
+        
+        x = self.transformer(x, rel_pos) # diff transformer
+        x = x.transpose(0, 1) # result is batch size, sequence length, embedding size
+        # print("x shape", x.shape, x[ 1 + self.num_registers:, :,:].shape)
+        
+        # Remove CLS token and registers
+        x = x[:, 1 + self.num_registers:, :] # batch size, num patches, embedding size   
+        
+        # Reshape and apply segmentation head
+        B, num_patches, embed_dim = x.shape
+        height = width = int(num_patches ** 0.5)  # Assuming num_patches is a perfect square
+
+        x = x.permute(0, 2, 1)  # Change shape to [batch_size, embedding_dim, num_patches]
+        x = x.view(B, embed_dim, height, width)  # Reshape to [batch_size, embedding_dim, height, width]
+
+        
+        # print("x shape prime", x.shape)
+        x = self.segmentation_head(x)
+        # Upsample to match input image resolution
+        x = F.interpolate(x, scale_factor=self.patch_size, mode='bilinear', align_corners=False)
+
+        return x
+    
+class VisionTransformer(BaseSegmentationModel):
+        
+    def __init__(self, num_classes, learning_rate=1e-3, ignore_index=0, num_channels=12, num_workers=4, train_dataset=None, val_dataset=None, test_dataset=None, batch_size=2, embed_dim=256, hidden_dim=512, num_heads=8, num_layers=6, patch_size=8, dropout=0.2, num_registers=4):
+
+        """Vision Transformer.
+
+        Args:
+            embed_dim: Dimensionality of the input feature vectors to the Transformer
+            hidden_dim: Dimensionality of the hidden layer in the feed-forward networks
+                         within the Transformer
+            num_channels: Number of channels of the input (3 for RGB)
+            num_heads: Number of heads to use in the Multi-Head Attention block
+            num_layers: Number of layers to use in the Transformer
+            num_classes: Number of classes to predict
+            patch_size: Number of pixels that the patches have per dimension
+            num_patches: Maximum number of patches an image can have
+            dropout: Amount of dropout to apply in the feed-forward network and
+                      on the input encoding
+
+
+            3 ref for classification
+            model_kwargs={
+                "embed_dim": 256,
+                "hidden_dim": 512,
+                "num_heads": 8,
+                "num_layers": 6,
+                "patch_size": 4,
+                "num_channels": 3,
+                "num_patches": 64,
+                "num_classes": 10,
+                "dropout": 0.2,
+            },
+            lr=3e-4,
+        """
+        super().__init__(num_classes, learning_rate, ignore_index, num_channels, num_workers, train_dataset, val_dataset, test_dataset, batch_size)
+
+        # num_heads = 8
+        # embed_dim = 256
+        # num_layers = 8
+        
+        
+        self.patch_size = patch_size
+        self.num_registers = num_registers
+        num_patches = (256 // patch_size) ** 2 # 256 is the image size
+        self.num_patches = num_patches
+
+        # Layers/Networks
+        self.input_layer = nn.Linear(self.num_channels * (patch_size**2), embed_dim)
+        
+        
+        
+        self.head_dim = embed_dim // (num_heads * 2)
+        
+        
+        #traditional transformer
+        self.transformer = nn.Sequential(
+            *(AttentionBlock(embed_dim, hidden_dim, num_heads, dropout=dropout) for _ in range(num_layers))
+        )
+        
+        # diff transformer
+        # self.transformer = MultiheadDiffAttn(embed_dim, num_layers, num_heads)
+        
+        # self.local_attention1 = LocalAttention(dim = embed_dim,  window_size=embed_dim*4, causal = True, look_backward= 2, look_forward=0, dropout=dropout)
+        # self.global_attention1 = AttentionBlock(embed_dim, hidden_dim, num_heads, dropout=dropout)
+        
+        # self.local_attention2 = LocalAttention(dim=embed_dim*2, window_size=embed_dim*4, causal=True, look_backward=2, look_forward=0, dropout=dropout)
+        # self.local_attention3 = LocalAttention(dim=embed_dim*2, window_size=embed_dim*4, causal=True, look_backward=2, look_forward=0, dropout=dropout)
+
+        # # Upsampling layer
+        # self.upsample = nn.ConvTranspose2d(embed_dim*2, embed_dim*2, kernel_size=2, stride=2)
+        # self.upsample2 = nn.ConvTranspose2d(embed_dim*2, embed_dim*2, kernel_size=2, stride=2)
+        
+        # self.mlp_head = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, num_classes))
+        self.segmentation_head = nn.Conv2d(embed_dim, self.num_classes , kernel_size=1)
+        self.dropout = nn.Dropout(dropout)
+
+        # Parameters/Embeddings
+        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
+        self.pos_embedding = nn.Parameter(torch.randn(1, 1 + self.num_patches + num_registers , embed_dim))
+        self.registers = nn.Parameter(torch.randn(1, num_registers, embed_dim))
+
+    def forward(self, msi_img, sar_img):
+        # Preprocess input
+        x = img_to_patch(msi_img, self.patch_size)
+        B, T, _ = x.shape
+        x = self.input_layer(x)
+
+        # Add CLS token and positional encoding
+        cls_token = self.cls_token.repeat(B, 1, 1)
+        registers = self.registers.repeat(B, 1, 1)
+        x = torch.cat([cls_token, registers, x], dim=1)
+        x = x + self.pos_embedding[:, : T + 1 + self.num_registers]
+
+        # Apply Transforrmer
+        x = self.dropout(x)
+        x = x.transpose(0, 1)
+        
+        x = self.transformer(x) # traditional transformer
+        
+        # rotary_emb = RotaryEmbedding(
+        #     self.head_dim,
+        #     base=10000.0,
+        #     interleaved=True,
+        #     device=self.device,
+        # )
+        
+        # seq_len = 1 + self.num_patches + self.num_registers
+        
+        # rotary_emb._update_cos_sin_cache(seq_len, device=self.device, dtype=torch.bfloat16)
+        # rel_pos = (rotary_emb._cos_cached, rotary_emb._sin_cached)
+    
+    
+    
+        # x = self.transformer(x, rel_pos) # diff transformer
+        x = x.transpose(0, 1) # result is batch size, sequence length, embedding size
+        # print("x shape", x.shape, x[ 1 + self.num_registers:, :,:].shape)
+        
+        # # pass the results to global and local attention blocks
+        # y = self.local_attention1(x[:, 1 + self.num_registers:, :],x[:, 1 + self.num_registers:, :],x[:, 1 + self.num_registers:, :])
+        
+        
+        # z = self.global_attention1(x)
+        
+        # combined = torch.cat([y, z[:, 1 + self.num_registers:, :]], dim=2)
+        # w = self.local_attention2(combined, combined, combined)
+        
+        
+
+
+        # # print("y shape", y.shape, "z shape", z.shape, "x shape", x.shape, "w shape", w.shape)
+
+
+        # # upsample the results
+        # batch_size, num_patches, embedding_size = w.shape
+        
+        # w_new = w.view(batch_size, embedding_size, int(num_patches ** 0.5), int(num_patches ** 0.5))
+        # w_upsampled = self.upsample(w_new)
+        
+
+
+        # # Remove CLS token and registers
+        x = x[:, 1 + self.num_registers:, :] # batch size, num patches, embedding size
+        # # print("x shape", x.shape)
+        
+        
+        # # reshape from batch, embedding size, height , width to batch , num patches, embedding size
+        
+        # w_reshaped = w_upsampled.permute(0, 2, 3, 1)
+        # w_reshaped = w_reshaped.view(batch_size, -1, embedding_size)
+        
+        
+        # # print("w_new shape", w_new.shape, w_upsampled.shape, w_reshaped.shape)
+
+        # t = self.local_attention3(w_reshaped, w_reshaped, w_reshaped)
+        
+        # # print("t shape", t.shape)
+        
+        
+        # batch_size, num_patches, embedding_size = t.shape
+        
+        # t_new = t.view(batch_size, embedding_size, int(num_patches ** 0.5), int(num_patches ** 0.5))
+        # t_upsampled = self.upsample(t_new)
+        
+        
+        
+        # # Reshape and apply segmentation head
+        B, num_patches, embed_dim = x.shape
+        height = width = int(num_patches ** 0.5)  # Assuming num_patches is a perfect square
+
+        x = x.permute(0, 2, 1)  # Change shape to [batch_size, embedding_dim, num_patches]
+        x = x.view(B, embed_dim, height, width)  # Reshape to [batch_size, embedding_dim, height, width]
+
+        
+        # print("x shape prime", x.shape)
+        
+        x = self.segmentation_head(x)
+
+        # # Perform classification prediction
+        # cls = x[0]
+        # out = self.mlp_head(cls)
+        # return out
+        
+        
+        # Upsample to match input image resolution
+        x = F.interpolate(x, scale_factor=self.patch_size, mode='bilinear', align_corners=False)
+
+        
+        
+        return x

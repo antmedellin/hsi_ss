@@ -34,7 +34,7 @@ builtins.print = functools.partial(print, flush=True)
 import segmentation_models_pytorch as smp
 from segmentation_models_pytorch.losses import JaccardLoss
 import models
-from models import SMP_SemanticSegmentation, DINOv2_SemanticSegmentation, SMP_Channel_SemanticSegmentation
+from models import SMP_SemanticSegmentation, DINOv2_SemanticSegmentation, SMP_Channel_SemanticSegmentation, VisionTransformer, DiffVisionTransformer
 import tifffile as tiff
 from torchvision.transforms import Resize
 
@@ -184,17 +184,17 @@ def compute_dataset_statistics(dataset, num_channels):
 dataset_dir='/workspaces/MMSeg-YREB'
 # 9 LULC classes are: 0) Background, 1) Tree, 2) Grassland, 3) Cropland, 4) Low Vegetation, 5) Wetland, 6) Water, 7) Built-up, 8) Bare ground, 9) Snow.
 num_classes = 10 # ignore 0 background 
-batch_size = 32
+batch_size = 16
 ignore_index=0 # background
 num_workers = 4 #  os.cpu_count() or 1  # Fallback to 1 if os.cpu_count() is None
-initial_lr =  0.001 
+initial_lr =  3e-4  # .001 for smp, 3e-4 for transformer
 swa_lr = 0.01
 # these should be multiple of 14 for dino model 
 # input image is of size 256x256
 img_height = 256
 img_width = 256
 max_num_epochs = 100
-accumulate_grad_batches = 2 # increases the effective batch size  # 1 means no accumulation # more important when batch size is small or not doing multi gpu training
+accumulate_grad_batches = 1 # increases the effective batch size  # 1 means no accumulation # more important when batch size is small or not doing multi gpu training
 grad_clip_val = 5 # clip gradients that have norm bigger than tmax_val)his
 training_model = True
 tuning_model = False
@@ -261,14 +261,20 @@ train_dataset = mmsegyrebDataset(image_set="train", root_dir=dataset_dir,  trans
 # print("Channel Std:", channel_std)
 # sys.exit()
 
-model = SMP_SemanticSegmentation(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, batch_size=batch_size)
+# model = SMP_SemanticSegmentation(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, batch_size=batch_size)
 # model = DINOv2_SemanticSegmentation(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset,  batch_size=batch_size)
 # model = SMP_Channel_SemanticSegmentation(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, batch_size=batch_size)
-model = SMP_SemanticSegmentation.load_from_checkpoint("lightning_logs/version_16/checkpoints/lowest_train_loss_hsi.ckpt")
+# model = SMP_SemanticSegmentation.load_from_checkpoint("lightning_logs/version_19/checkpoints/lowest_train_loss_hsi.ckpt")
+
+model = VisionTransformer(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, batch_size=batch_size)
+# model = VisionTransformer.load_from_checkpoint("lightning_logs/version_39/checkpoints/lowest_train_loss_hsi.ckpt")
+
+# model = DiffVisionTransformer(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, batch_size=batch_size)
+
 
 checkpoint_callback_train_loss = ModelCheckpoint(monitor="train_loss", mode="min", save_top_k=1, filename="lowest_train_loss_hsi")
-checkpoint_callback_train_miou = ModelCheckpoint(monitor="train_miou", mode="max", save_top_k=1, filename="best_train_miou_hsi")
-checkpoint_callback_last_epoch = ModelCheckpoint(monitor="epoch", mode="max", save_top_k=1, filename="last_epoch_hsi")
+# checkpoint_callback_train_miou = ModelCheckpoint(monitor="train_miou", mode="max", save_top_k=1, filename="best_train_miou_hsi")
+# checkpoint_callback_last_epoch = ModelCheckpoint(monitor="epoch", mode="max", save_top_k=1, filename="last_epoch_hsi")
 
 # Set the float32 matmul precision to 'medium' or 'high'
 torch.set_float32_matmul_precision('medium')
@@ -277,11 +283,11 @@ trainer = L.Trainer(
     max_epochs=max_num_epochs, 
     accumulate_grad_batches=accumulate_grad_batches, 
     callbacks=[
-        EarlyStopping(monitor="train_loss", mode="min", verbose=True, patience=10), 
-        checkpoint_callback_train_loss, checkpoint_callback_last_epoch ,  checkpoint_callback_train_miou, StochasticWeightAveraging(swa_lrs=swa_lr) ], 
+        EarlyStopping(monitor="train_loss", mode="min", verbose=True, patience=15), 
+        checkpoint_callback_train_loss, StochasticWeightAveraging(swa_lrs=swa_lr) ], 
     accelerator="gpu", 
     devices="auto", 
-    gradient_clip_val=grad_clip_val, 
+    # gradient_clip_val=grad_clip_val, 
     precision="16-mixed" ) 
 
 if training_model == True: 
@@ -317,9 +323,9 @@ if test_model:
     # make sure to resize the images to the original size before saving the results (256x256)
     # save the predicted results as tiff files without compression and have the same name as the original image
 
-    model = SMP_SemanticSegmentation.load_from_checkpoint("lightning_logs/version_38/checkpoints/lowest_train_loss_hsi.ckpt")
+    model = SMP_SemanticSegmentation.load_from_checkpoint("lightning_logs/version_14/checkpoints/lowest_train_loss_hsi.ckpt")
     test_dataset = mmsegyrebDataset(image_set="test", root_dir=dataset_dir,  transform=test_transform)
-    results_dir = "submitted_results/submission1/results"
+    results_dir = "submitted_results/submission3/results"
     model.results_dir = results_dir
 
     os.makedirs(results_dir, exist_ok=True)
