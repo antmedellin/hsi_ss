@@ -29,6 +29,8 @@ from rotary import RotaryEmbedding
 from rotary import apply_rotary_emb
 from local_attention import LocalAttention
 from flash_attn import flash_attn_func
+from transformers import Swinv2Config, Swinv2Model, UperNetConfig, UperNetForSemanticSegmentation
+from transformers import ConvNextConfig, Swinv2Config, ConvNextV2Config, SwinConfig
 #  pip install local-attention
 # pip install flash-attn --no-build-isolation
 # https://github.com/xiayuqing0622/customized-flash-attention 
@@ -288,7 +290,7 @@ class BaseSegmentationModel(L.LightningModule):
             # scheduler = lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20)
             # scheduler = lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1, eta_min=1e-6)
 
-            # scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
+            scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
             
             # Learning rate warmup scheduler for a warmup period of 5 epochs
             def lr_lambda(epoch):
@@ -296,13 +298,13 @@ class BaseSegmentationModel(L.LightningModule):
                     return float(epoch) / 5
                 return 1.0
 
-            warmup_scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda)
+            # warmup_scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda)
             
             # Cosine annealing warm restarts scheduler
-            cosine_scheduler = lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1, eta_min=1e-6)
+            # cosine_scheduler = lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1, eta_min=1e-6)
             
             # Combine the warmup and cosine annealing schedulers
-            scheduler = lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[5])
+            # scheduler = lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[5])
         
 
             return {
@@ -850,10 +852,75 @@ class DiffVisionTransformer(BaseSegmentationModel):
         x = F.interpolate(x, scale_factor=self.patch_size, mode='bilinear', align_corners=False)
 
         return x
+
+
+# refernce https://github.com/yassouali/pytorch-segmentation/blob/master/models/upernet.py 
+class PSPModule(nn.Module):
+    # In the original inmplementation they use precise RoI pooling 
+    # Instead of using adaptative average pooling
+    def __init__(self, in_channels, bin_sizes=[1, 2, 4, 6]):
+        super(PSPModule, self).__init__()
+        out_channels = in_channels // len(bin_sizes)
+        self.stages = nn.ModuleList([self._make_stages(in_channels, out_channels, b_s) 
+                                                        for b_s in bin_sizes])
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(in_channels+(out_channels * len(bin_sizes)), in_channels, 
+                                    kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(0.1)
+        )
+
+    def _make_stages(self, in_channels, out_channels, bin_sz):
+        prior = nn.AdaptiveAvgPool2d(output_size=bin_sz)
+        conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        bn = nn.BatchNorm2d(out_channels)
+        relu = nn.ReLU(inplace=True)
+        return nn.Sequential(prior, conv, bn, relu)
     
+    def forward(self, features):
+        h, w = features.size()[2], features.size()[3]
+        pyramids = [features]
+        pyramids.extend([F.interpolate(stage(features), size=(h, w), mode='bilinear', 
+                                        align_corners=True) for stage in self.stages])
+        output = self.bottleneck(torch.cat(pyramids, dim=1))
+        return output
+
+
+def up_and_add(x, y):
+    return F.interpolate(x, size=(y.size(2), y.size(3)), mode='bilinear', align_corners=True) + y
+
+class FPN_fuse(nn.Module):
+    def __init__(self, feature_channels=[256, 512, 1024, 2048], fpn_out=256):
+        super(FPN_fuse, self).__init__()
+        assert feature_channels[0] == fpn_out
+        self.conv1x1 = nn.ModuleList([nn.Conv2d(ft_size, fpn_out, kernel_size=1)
+                                    for ft_size in feature_channels[1:]])
+        self.smooth_conv =  nn.ModuleList([nn.Conv2d(fpn_out, fpn_out, kernel_size=3, padding=1)] 
+                                    * (len(feature_channels)-1))
+        self.conv_fusion = nn.Sequential(
+            nn.Conv2d(len(feature_channels)*fpn_out, fpn_out, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(fpn_out),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, features):
+        
+        features[1:] = [conv1x1(feature) for feature, conv1x1 in zip(features[1:], self.conv1x1)]
+        P = [up_and_add(features[i], features[i-1]) for i in reversed(range(1, len(features)))]
+        P = [smooth_conv(x) for smooth_conv, x in zip(self.smooth_conv, P)]
+        P = list(reversed(P))
+        P.append(features[-1]) #P = [P1, P2, P3, P4]
+        H, W = P[0].size(2), P[0].size(3)
+        P[1:] = [F.interpolate(feature, size=(H, W), mode='bilinear', align_corners=True) for feature in P[1:]]
+
+        x = self.conv_fusion(torch.cat((P), dim=1))
+        return x
+    
+        
 class VisionTransformer(BaseSegmentationModel):
         
-    def __init__(self, num_classes, learning_rate=1e-3, ignore_index=0, num_channels=12, num_workers=4, train_dataset=None, val_dataset=None, test_dataset=None, batch_size=2, embed_dim=256, hidden_dim=512, num_heads=8, num_layers=6, patch_size=8, dropout=0.2, num_registers=4):
+    def __init__(self, num_classes, learning_rate=1e-3, ignore_index=0, num_channels=12, num_workers=4, train_dataset=None, val_dataset=None, test_dataset=None, batch_size=2, embed_dim=512, hidden_dim=1024, num_heads=16, num_layers=8, patch_size=8, dropout=0.2, num_registers=4):
 
         """Vision Transformer.
 
@@ -910,21 +977,15 @@ class VisionTransformer(BaseSegmentationModel):
             *(AttentionBlock(embed_dim, hidden_dim, num_heads, dropout=dropout) for _ in range(num_layers))
         )
         
-        # diff transformer
-        # self.transformer = MultiheadDiffAttn(embed_dim, num_layers, num_heads)
         
-        # self.local_attention1 = LocalAttention(dim = embed_dim,  window_size=embed_dim*4, causal = True, look_backward= 2, look_forward=0, dropout=dropout)
-        # self.global_attention1 = AttentionBlock(embed_dim, hidden_dim, num_heads, dropout=dropout)
-        
-        # self.local_attention2 = LocalAttention(dim=embed_dim*2, window_size=embed_dim*4, causal=True, look_backward=2, look_forward=0, dropout=dropout)
-        # self.local_attention3 = LocalAttention(dim=embed_dim*2, window_size=embed_dim*4, causal=True, look_backward=2, look_forward=0, dropout=dropout)
-
-        # # Upsampling layer
-        # self.upsample = nn.ConvTranspose2d(embed_dim*2, embed_dim*2, kernel_size=2, stride=2)
-        # self.upsample2 = nn.ConvTranspose2d(embed_dim*2, embed_dim*2, kernel_size=2, stride=2)
-        
-        # self.mlp_head = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, num_classes))
+        # upernet  
+        #backbone is the transformer encoder 
+        self.ppn = PSPModule(embed_dim)
+        self.FPN = FPN_fuse(feature_channels=[embed_dim, embed_dim, embed_dim, embed_dim], fpn_out=embed_dim)
         self.segmentation_head = nn.Conv2d(embed_dim, self.num_classes , kernel_size=1)
+        
+        # original segmentation head
+        # self.segmentation_head = nn.Conv2d(embed_dim, self.num_classes , kernel_size=1)
         self.dropout = nn.Dropout(dropout)
 
         # Parameters/Embeddings
@@ -950,70 +1011,12 @@ class VisionTransformer(BaseSegmentationModel):
         
         x = self.transformer(x) # traditional transformer
         
-        # rotary_emb = RotaryEmbedding(
-        #     self.head_dim,
-        #     base=10000.0,
-        #     interleaved=True,
-        #     device=self.device,
-        # )
-        
-        # seq_len = 1 + self.num_patches + self.num_registers
-        
-        # rotary_emb._update_cos_sin_cache(seq_len, device=self.device, dtype=torch.bfloat16)
-        # rel_pos = (rotary_emb._cos_cached, rotary_emb._sin_cached)
-    
-    
-    
-        # x = self.transformer(x, rel_pos) # diff transformer
+       
         x = x.transpose(0, 1) # result is batch size, sequence length, embedding size
-        # print("x shape", x.shape, x[ 1 + self.num_registers:, :,:].shape)
         
-        # # pass the results to global and local attention blocks
-        # y = self.local_attention1(x[:, 1 + self.num_registers:, :],x[:, 1 + self.num_registers:, :],x[:, 1 + self.num_registers:, :])
-        
-        
-        # z = self.global_attention1(x)
-        
-        # combined = torch.cat([y, z[:, 1 + self.num_registers:, :]], dim=2)
-        # w = self.local_attention2(combined, combined, combined)
-        
-        
-
-
-        # # print("y shape", y.shape, "z shape", z.shape, "x shape", x.shape, "w shape", w.shape)
-
-
-        # # upsample the results
-        # batch_size, num_patches, embedding_size = w.shape
-        
-        # w_new = w.view(batch_size, embedding_size, int(num_patches ** 0.5), int(num_patches ** 0.5))
-        # w_upsampled = self.upsample(w_new)
-        
-
-
         # # Remove CLS token and registers
         x = x[:, 1 + self.num_registers:, :] # batch size, num patches, embedding size
         # # print("x shape", x.shape)
-        
-        
-        # # reshape from batch, embedding size, height , width to batch , num patches, embedding size
-        
-        # w_reshaped = w_upsampled.permute(0, 2, 3, 1)
-        # w_reshaped = w_reshaped.view(batch_size, -1, embedding_size)
-        
-        
-        # # print("w_new shape", w_new.shape, w_upsampled.shape, w_reshaped.shape)
-
-        # t = self.local_attention3(w_reshaped, w_reshaped, w_reshaped)
-        
-        # # print("t shape", t.shape)
-        
-        
-        # batch_size, num_patches, embedding_size = t.shape
-        
-        # t_new = t.view(batch_size, embedding_size, int(num_patches ** 0.5), int(num_patches ** 0.5))
-        # t_upsampled = self.upsample(t_new)
-        
         
         
         # # Reshape and apply segmentation head
@@ -1024,19 +1027,103 @@ class VisionTransformer(BaseSegmentationModel):
         x = x.view(B, embed_dim, height, width)  # Reshape to [batch_size, embedding_dim, height, width]
 
         
+        # Apply PSPModule
+        x = self.ppn(x)
+
+        # Apply FPN_fuse
+        x = self.FPN([x, x, x, x])  # Assuming the same feature map for simplicity
+
+            
         # print("x shape prime", x.shape)
         
-        x = self.segmentation_head(x)
-
-        # # Perform classification prediction
-        # cls = x[0]
-        # out = self.mlp_head(cls)
-        # return out
-        
+        x = self.segmentation_head(x)      
         
         # Upsample to match input image resolution
         x = F.interpolate(x, scale_factor=self.patch_size, mode='bilinear', align_corners=False)
 
-        
-        
         return x
+    
+    
+class SWINTransformer(BaseSegmentationModel):
+        
+    def __init__(self, num_classes, learning_rate=1e-3, ignore_index=0, num_channels=12, num_workers=4, train_dataset=None, val_dataset=None, test_dataset=None, batch_size=2, embed_dim=192, patch_size=8, dropout=0.2, num_registers=4):
+
+   
+        super().__init__(num_classes, learning_rate, ignore_index, num_channels, num_workers, train_dataset, val_dataset, test_dataset, batch_size)
+
+        # embed dim 192, hidden is 1536
+        
+        self.patch_size = patch_size
+        self.num_registers = num_registers
+        num_patches = (256 // patch_size) ** 2 # 256 is the image size
+        self.num_patches = num_patches
+
+        # SWIN Transformer 
+        # compare the perfromance of swin vs convnextv2
+        # backbone_configuration = ConvNextV2Config(num_channels=num_channels, patch_size=patch_size, image_size=256, embed_dim=embed_dim, hidden_dropout_prob= dropout, attention_probs_dropout_prob=dropout, out_features=["stage1", "stage2", "stage3", "stage4"])
+        # seg_head = UperNetConfig(backbone_config=backbone_configuration, num_labels = num_classes)
+        # self.swin_upernet = UperNetForSemanticSegmentation(seg_head)
+        
+        # backbone_configuration = Swinv2Config(num_channels=num_channels, patch_size=patch_size, image_size=256, embed_dim=embed_dim, hidden_dropout_prob= dropout, attention_probs_dropout_prob=dropout, out_features=["stage1", "stage2", "stage3", "stage4"])
+        
+        # self.model = Swinv2Model(backbone_configuration)
+    
+        backbone_configuration = Swinv2Config(
+            embed_dim=192,
+            depths=[2, 2, 18, 2],
+            num_heads=[6, 12, 24, 48],
+            window_size=12,
+            ape=False,
+            drop_path_rate=0.3,
+            patch_norm=True,
+            use_checkpoint=False,
+            num_channels=num_channels,
+            patch_size=patch_size,
+            image_size=256,
+            hidden_dropout_prob=dropout,
+            attention_probs_dropout_prob=dropout,
+            out_features=["stage1", "stage2", "stage3", "stage4"]
+        )
+
+        # Define the segmentation head configuration
+        seg_head = UperNetConfig(
+            backbone_config=backbone_configuration,
+            num_labels=num_classes,
+            decode_head=dict(
+                in_channels=[192, 384, 768, 1536],
+                num_classes=num_classes,
+                loss_decode=dict(
+                    type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0,
+                    class_weight=[0.5, 1.31237, 1.38874, 1.39761, 1.5, 1.47807]
+                )
+            ),
+            auxiliary_head=dict(
+                in_channels=768,
+                num_classes=num_classes,
+                loss_decode=dict(
+                    type='CrossEntropyLoss', use_sigmoid=False, loss_weight=0.4,
+                    class_weight=[0.5, 1.31237, 1.38874, 1.39761, 1.5, 1.47807]
+                )
+            )
+        )
+
+        # Initialize the model
+        self.model = UperNetForSemanticSegmentation(seg_head)
+        
+        
+        # print(self.swin_upernet.config)
+
+        
+       
+    def forward(self, msi_img, sar_img):
+         
+        # print("msi_img shape", msi_img.shape)
+        # outputs = self.swin_upernet(msi_img)
+        
+        outputs = self.model(msi_img)
+        
+        x = outputs
+        
+        print("x shape", x.shape)
+
+        return x.logits

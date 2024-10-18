@@ -34,7 +34,7 @@ builtins.print = functools.partial(print, flush=True)
 import segmentation_models_pytorch as smp
 from segmentation_models_pytorch.losses import JaccardLoss
 import models
-from models import SMP_SemanticSegmentation, DINOv2_SemanticSegmentation, SMP_Channel_SemanticSegmentation, VisionTransformer, DiffVisionTransformer
+from models import SMP_SemanticSegmentation, DINOv2_SemanticSegmentation, SMP_Channel_SemanticSegmentation, VisionTransformer, DiffVisionTransformer, SWINTransformer
 import tifffile as tiff
 from torchvision.transforms import Resize
 
@@ -187,7 +187,7 @@ num_classes = 10 # ignore 0 background
 batch_size = 16
 ignore_index=0 # background
 num_workers = 4 #  os.cpu_count() or 1  # Fallback to 1 if os.cpu_count() is None
-initial_lr =  3e-4  # .001 for smp, 3e-4 for transformer
+initial_lr =  10e-4  # .001 for smp, 3e-4 for transformer
 swa_lr = 0.01
 # these should be multiple of 14 for dino model 
 # input image is of size 256x256
@@ -271,6 +271,10 @@ model = VisionTransformer(num_classes=num_classes,learning_rate=initial_lr, igno
 
 # model = DiffVisionTransformer(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, batch_size=batch_size)
 
+model = SWINTransformer(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, batch_size=batch_size)
+
+
+# sys.exit()
 
 checkpoint_callback_train_loss = ModelCheckpoint(monitor="train_loss", mode="min", save_top_k=1, filename="lowest_train_loss_hsi")
 # checkpoint_callback_train_miou = ModelCheckpoint(monitor="train_miou", mode="max", save_top_k=1, filename="best_train_miou_hsi")
