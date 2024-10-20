@@ -92,11 +92,18 @@ class CombinedLoss(nn.Module):
 
 def collate_fn(inputs):
 
+    # multispectral 
+    # batch = dict()
+    # batch["msi_pixel_values"] = torch.stack([i[0] for i in inputs], dim=0)
+    # batch["sar_pixel_values"] = torch.stack([i[1] for i in inputs], dim=0)
+    # batch["labels"] = torch.stack([i[2] for i in inputs], dim=0).long()
+    # batch["filenames"] = [i[3] for i in inputs]
+    
+    # hyperspectral
     batch = dict()
-    batch["msi_pixel_values"] = torch.stack([i[0] for i in inputs], dim=0)
-    batch["sar_pixel_values"] = torch.stack([i[1] for i in inputs], dim=0)
+    batch["hsi_pixel_values"] = torch.stack([i[0] for i in inputs], dim=0)
+    batch["rgb_pixel_values"] = torch.stack([i[1] for i in inputs], dim=0)
     batch["labels"] = torch.stack([i[2] for i in inputs], dim=0).long()
-    batch["filenames"] = [i[3] for i in inputs]
 
     return batch   
         
@@ -219,24 +226,28 @@ class BaseSegmentationModel(L.LightningModule):
             self.log(f"{step_type}_miou", result_miou, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
             self.log(f"{step_type}_f1_mean", results_f1_mean, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
             
-           
-        def training_step(self, batch):
+        
+        def hsi_step(self, batch):
             
-            step_type = "train"
-            sar_pixel_values = batch["sar_pixel_values"]
+            rgb_pixel_values = batch["rgb_pixel_values"]
+            hsi_pixel_values = batch["hsi_pixel_values"]
+            labels = batch["labels"]     
+            
+            logits = self.forward(hsi_pixel_values,rgb_pixel_values)
+            
+            return logits , labels
+        
+        def msi_step(self, batch):
+            
             msi_pixel_values = batch["msi_pixel_values"]
+            sar_pixel_values = batch["sar_pixel_values"]
             labels = batch["labels"]     
             
             logits = self.forward(msi_pixel_values,sar_pixel_values)
-            loss = self.loss_fn(logits, labels) 
             
-            self.log_data(step_type, logits, labels, loss)
-
-            return loss
+            return logits , labels
         
-        def test_step(self, batch):
-            
-            step_type = "test"
+        def msi_test_step(self, batch):
             sar_pixel_values = batch["sar_pixel_values"]
             msi_pixel_values = batch["msi_pixel_values"]
             labels = batch["labels"]    
@@ -262,25 +273,43 @@ class BaseSegmentationModel(L.LightningModule):
                 # Save the prediction as a TIFF file without compression
                 result_path = os.path.join(self.results_dir, filenames[i])
                 tiff.imwrite(result_path, resized_prediction.astype(np.uint8), compression=None)
-
+            return logits
             
-    
+        def training_step(self, batch):
+            
+            step_type = "train"      
+            
+            logits, labels = self.hsi_step(batch)
+            # logits, labels = self.msi_step(batch)
+            
+            loss = self.loss_fn(logits, labels) 
+            
+            self.log_data(step_type, logits, labels, loss)
+
+            return loss
+        
+        def test_step(self, batch):
+            
+            step_type = "test"
+            
+            # logits = self.msi_test_step(batch)
+            
+            logits, labels = self.hsi_step(batch)
+            loss = self.loss_fn(logits, labels) 
+            self.log_data(step_type, logits, labels, loss)
 
             return logits
         
-        # def validation_step(self, batch):
+        def validation_step(self, batch):
                 
-        #     step_type = "val"
-        #     sar_pixel_values = batch["sar_pixel_values"]
-        #     msi_pixel_values = batch["msi_pixel_values"]
-        #     labels = batch["labels"]     
+            step_type = "val"
             
-        #     logits = self.forward(msi_pixel_values,sar_pixel_values)
-        #     loss = self.loss_fn(logits, labels) 
             
-        #     self.log_data(step_type, logits, labels, loss)
+            logits, labels = self.hsi_step(batch)
+            loss = self.loss_fn(logits, labels) 
+            self.log_data(step_type, logits, labels, loss)
 
-        #     return loss
+            return loss
         
         def configure_optimizers(self):
             optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.learning_rate)
@@ -290,7 +319,7 @@ class BaseSegmentationModel(L.LightningModule):
             # scheduler = lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20)
             # scheduler = lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1, eta_min=1e-6)
 
-            scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
+            # scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
             
             # Learning rate warmup scheduler for a warmup period of 5 epochs
             def lr_lambda(epoch):
@@ -298,13 +327,13 @@ class BaseSegmentationModel(L.LightningModule):
                     return float(epoch) / 5
                 return 1.0
 
-            # warmup_scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda)
+            warmup_scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda)
             
             # Cosine annealing warm restarts scheduler
-            # cosine_scheduler = lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1, eta_min=1e-6)
+            cosine_scheduler = lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1, eta_min=1e-6)
             
             # Combine the warmup and cosine annealing schedulers
-            # scheduler = lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[5])
+            scheduler = lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[5])
         
 
             return {
@@ -312,7 +341,7 @@ class BaseSegmentationModel(L.LightningModule):
             # "lr_scheduler": scheduler
             'lr_scheduler': {
                 'scheduler': scheduler,
-                'monitor': 'train_loss',  # Metric to monitor for learning rate adjustment
+                'monitor': 'val_loss',  # Metric to monitor for learning rate adjustment
                 'interval': 'epoch',    # How often to apply the scheduler
                 'frequency': 1          # Frequency of the scheduler
             }
@@ -322,9 +351,9 @@ class BaseSegmentationModel(L.LightningModule):
             
             return  DataLoader(self.train_dataset, batch_size=self.hparams.batch_size, shuffle=True, collate_fn=collate_fn,num_workers=self.num_workers)
         
-        # def val_dataloader(self):
+        def val_dataloader(self):
             
-        #     return  DataLoader(self.val_dataset, batch_size=self.hparams.batch_size, shuffle=False, collate_fn=collate_fn,num_workers=self.num_workers)
+            return  DataLoader(self.val_dataset, batch_size=self.hparams.batch_size, shuffle=False, collate_fn=collate_fn,num_workers=self.num_workers)
         
         def test_dataloader(self):
             

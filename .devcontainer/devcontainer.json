@@ -4,7 +4,7 @@
 
     "mounts":[
         // "source=${localWorkspaceFolder}/../MMSeg-YREB,target=/workspaces/MMSeg-YREB,type=bind,consistency=cached",
-        "source=${localWorkspaceFolder}/../HyperImages/hsi_ss/MMSeg-YREB,target=/workspaces/MMSeg-YREB,type=bind,consistency=cached",
+        // "source=${localWorkspaceFolder}/../HyperImages/hsi_ss/MMSeg-YREB,target=/workspaces/MMSeg-YREB,type=bind,consistency=cached",
     ],
 
     "runArgs":[

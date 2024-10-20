@@ -40,6 +40,145 @@ from torchvision.transforms import Resize
 
 # tensorboard --logdir=./lightning_logs/
 # ctrl shft p -> Python: Launch Tensorboard  select lightning logs
+   
+   
+def extract_rgb(cube, red_layer=70 , green_layer=53, blue_layer=19):
+
+    red_img = cube[ red_layer,:,:]
+    green_img = cube[ green_layer,:,:]
+    blue_img = cube[ blue_layer,:,:]
+        
+    data=np.stack([red_img,green_img,blue_img], axis=-1)
+    
+    # convert from x,y,channels to channels, x, y
+    # data = np.transpose(data, (2, 0, 1))
+    
+    return data 
+
+def GDAL_imreadmulti(file_name):
+    # Open the dataset
+    dataset = gdal.Open(file_name)
+
+    # Check if opened
+    if dataset:
+      # print("Dataset opened...")
+      width = dataset.RasterXSize
+      height = dataset.RasterYSize
+      num_bands = dataset.RasterCount
+
+      image_bands = []
+
+      for band_num in range(1, num_bands+1):
+        band = dataset.GetRasterBand(band_num)
+
+        # Read band data
+        band_data = band.ReadAsArray()
+
+        # Create an OpenCV Mat from the band data
+        band_mat = np.array(band_data, dtype='float32')
+
+        # Correct the orientation of the image
+        band_mat = np.transpose(band_mat)
+        band_mat = cv2.flip(band_mat, 1)
+        
+        # Normalize the band data to the range [0, 1]
+        band_min = band_mat.min()
+        band_max = band_mat.max()
+        normalized_band_mat = (band_mat - band_min) / (band_max - band_min)
+        band_mat = normalized_band_mat
+
+        # Apply threshold and convert to 8-bit unsigned integers
+        _, band_mat = cv2.threshold(band_mat, 1.0, 1.0, cv2.THRESH_TRUNC)
+        band_mat = cv2.convertScaleAbs(band_mat, alpha=(255.0))
+
+        # Add the processed band to the list
+        image_bands.append(band_mat)
+        
+        cube=np.array(image_bands)
+        
+        # convert from x,y,channels to channels, x, y
+        # data = np.transpose(cube, (2, 0, 1))
+        
+      return True, cube
+
+    else:
+      print("GDAL Error: ", gdal.GetLastErrorMsg())
+      return False, []
+
+class LIBHSIDataset(Dataset):
+    def __init__(self, image_set,  root_dir, id2color, transform=None):
+        
+        # image_set # train ,test, validation
+        self.transform = transform
+        self.root = join(root_dir,image_set)
+        
+        # Convert id2color to a numpy array for easier comparison
+        self.id2color_np = np.array(list(id2color.values()))
+
+        self.img_dir =  join(self.root, "reflectance_cubes")
+        self.label_dir = join(self.root, "labels")
+        
+        self.img_names = [f for f in os.listdir(self.img_dir) if f.endswith('.' + 'dat')]
+        self.num_images = len( self.img_names  ) 
+
+        assert self.num_images == len(os.listdir(self.label_dir))
+        
+        self.img_labels = [f for f in os.listdir(self.label_dir)]
+        
+        # sort img_names and img_labels
+        self.img_names.sort()
+        self.img_labels.sort()
+
+    def __len__(self):
+        return self.num_images
+
+    def __getitem__(self, idx):
+        label_name, ext_label = os.path.splitext(self.img_labels[idx])
+        
+        hsi_name, ext_hsi = os.path.splitext(self.img_names[idx])
+        
+        assert label_name == hsi_name # make sure they have the same name 
+        
+        # read the label image 
+        label_path = join(self.label_dir, self.img_labels[idx])
+        label_img = Image.open(label_path).convert('RGB')
+        
+        label_img_np = np.array(label_img) # uint8 x,y,channels
+        
+        #convert labeled rgb image to greyscale
+        label_img_greyscale = np.zeros(label_img_np.shape[:2], dtype=np.uint8)
+        for i, color in enumerate(self.id2color_np):
+            # Find where in the target the current color is
+            mask = np.all(label_img_np == color, axis=-1)
+            
+            # Wherever the color is found, set the corresponding index in target_new to the current class label
+            label_img_greyscale[mask] = i
+        
+        hsi_path = join(self.img_dir, self.img_names[idx])
+        _, hsi_img = GDAL_imreadmulti(hsi_path)
+   
+        rgb_img = extract_rgb(hsi_img) 
+
+        hsi_img = np.transpose(hsi_img, (1, 2, 0)) # transpose to x,y,channels for albumnetations
+        
+        # apply transformations  # must be in x,y,channels format        
+        if self.transform:            
+            transformed = self.transform(image = rgb_img, mask = label_img_greyscale, hsi_image = hsi_img)
+        
+            hsi_img, rgb_img, label_img_greyscale = torch.tensor(transformed['hsi_image']), torch.tensor(transformed['image']), torch.tensor(transformed['mask'])
+        else:
+            hsi_img, rgb_img, label_img_greyscale = torch.tensor(hsi_img), torch.tensor(rgb_img), torch.tensor(label_img_greyscale)
+            
+            
+        #convert from x,y,channels to channels, x, y
+        hsi_img = hsi_img.permute(2,0,1)
+        rgb_img = rgb_img.permute(2,0,1)
+        
+        #convert from uint8 to float32
+        hsi_img = hsi_img.float()
+        rgb_img = rgb_img.float()
+            
+        return hsi_img, rgb_img, label_img_greyscale   
     
 class mmsegyrebDataset(Dataset):
     def __init__(self, image_set,  root_dir,  transform=None):
@@ -181,11 +320,31 @@ def compute_dataset_statistics(dataset, num_channels):
     return channel_min, channel_max, channel_mean, channel_std
     
 
-dataset_dir='/workspaces/MMSeg-YREB'
+# dataset_dir='/workspaces/MMSeg-YREB'
+
+dataset_dir='/workspaces/LIB-HSI'
+rgb_data_json = '/workspaces/hsi_ss/lib_hsi_rgb.json'
+file_data =  open(rgb_data_json)
+file_contents = json.load(file_data)
+id2label ={}
+id2color = {}
+for i, item in enumerate(file_contents['items'], start=0):
+    id2label[i] = item['name']
+    id2color[i] = [item['red_value'], item['green_value'], item['blue_value']]
+# print(id2label)
+# print(id2color)
+num_classes = len(id2label)
+
+
 # 9 LULC classes are: 0) Background, 1) Tree, 2) Grassland, 3) Cropland, 4) Low Vegetation, 5) Wetland, 6) Water, 7) Built-up, 8) Bare ground, 9) Snow.
-num_classes = 10 # ignore 0 background 
+# num_classes = 10 # ignore 0 background 
+num_classes = len(id2label)
+
 batch_size = 16
-ignore_index=0 # background
+# ignore_index=0 # background
+ignore_index=7 # misc. class, 
+
+
 num_workers = 4 #  os.cpu_count() or 1  # Fallback to 1 if os.cpu_count() is None
 initial_lr =  10e-4  # .001 for smp, 3e-4 for transformer
 swa_lr = 0.01
@@ -208,11 +367,11 @@ num_channels = 14
 # std = [0.225] * num_channels   
 
 
-mean = [1368.6125, 1159.3759, 1066.2174, 1000.4777, 1233.8301, 1868.6222, 2124.8076, 2111.7993, 2322.8552, 1078.5980, 1715.7476, 1081.0111, -1487.6545, -803.5430]
-std = [491.7540, 544.0209, 557.4269, 675.8509, 660.5626, 602.1366, 635.2303, 644.9349, 678.6457, 557.9268, 665.9048, 528.2560, 430.0971, 362.5961]
+# mean = [1368.6125, 1159.3759, 1066.2174, 1000.4777, 1233.8301, 1868.6222, 2124.8076, 2111.7993, 2322.8552, 1078.5980, 1715.7476, 1081.0111, -1487.6545, -803.5430]
+# std = [491.7540, 544.0209, 557.4269, 675.8509, 660.5626, 602.1366, 635.2303, 644.9349, 678.6457, 557.9268, 665.9048, 528.2560, 430.0971, 362.5961]
 
-min_val = [688., 467., 294., 173., 173., 196., 188., 177., 181., 82., 61., 30., -7992., -7478.]
-max_val = [11824., 13134., 13005., 14074., 13930., 13746., 14287., 15032., 14416., 9006., 11881., 11510., 5699., 6385.]
+# min_val = [688., 467., 294., 173., 173., 196., 188., 177., 181., 82., 61., 30., -7992., -7478.]
+# max_val = [11824., 13134., 13005., 14074., 13930., 13746., 14287., 15032., 14416., 9006., 11881., 11510., 5699., 6385.]
 
 
 # Channel Min: tensor([  688.,   467.,   294.,   173.,   173.,   196.,   188.,   177.,   181.,
@@ -234,7 +393,7 @@ torch.cuda.empty_cache()
 
 test_transform = A.Compose([
     A.Resize(width=img_width, height=img_height), 
-    A.Normalize(mean=mean, std=std, normalization="image_per_channel", max_pixel_value=15032)
+    A.Normalize(normalization="image_per_channel", max_pixel_value=255.0)
 ], additional_targets={"msi_image": "image"})
 
 train_transform = A.Compose([
@@ -246,11 +405,16 @@ train_transform = A.Compose([
     A.RandomScale(scale_limit=0.2, p=0.5),
     A.ElasticTransform(alpha=1, sigma=50, alpha_affine=None, p=0.5),  # Set alpha_affine to None
     A.Resize(width=img_width, height=img_height), 
-    A.Normalize(mean=mean, std=std, normalization="image", max_pixel_value=15032)
+    # A.Normalize(mean=mean, std=std, normalization="image", max_pixel_value=15032)
+    A.Normalize(normalization="image", max_pixel_value=255.0)
 ], additional_targets={"msi_image": "image"})
 
 
-train_dataset = mmsegyrebDataset(image_set="train", root_dir=dataset_dir,  transform=train_transform)
+# train_dataset = mmsegyrebDataset(image_set="train", root_dir=dataset_dir,  transform=train_transform)
+
+train_dataset = LIBHSIDataset(image_set="train", root_dir=dataset_dir, id2color=id2color, transform=train_transform)
+test_dataset = LIBHSIDataset(image_set="test", root_dir=dataset_dir, id2color=id2color,  transform=test_transform)
+val_dataset = LIBHSIDataset(image_set="validation", root_dir=dataset_dir, id2color=id2color, transform=test_transform)
 
 
 # channel_min, channel_max, channel_mean, channel_std = compute_dataset_statistics(train_dataset, num_channels)
@@ -261,17 +425,19 @@ train_dataset = mmsegyrebDataset(image_set="train", root_dir=dataset_dir,  trans
 # print("Channel Std:", channel_std)
 # sys.exit()
 
-# model = SMP_SemanticSegmentation(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, batch_size=batch_size)
+model = SMP_SemanticSegmentation(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, val_dataset=val_dataset, test_dataset=test_dataset, batch_size=batch_size)
+
+
 # model = DINOv2_SemanticSegmentation(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset,  batch_size=batch_size)
 # model = SMP_Channel_SemanticSegmentation(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, batch_size=batch_size)
 # model = SMP_SemanticSegmentation.load_from_checkpoint("lightning_logs/version_19/checkpoints/lowest_train_loss_hsi.ckpt")
 
-model = VisionTransformer(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, batch_size=batch_size)
+# model = VisionTransformer(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, batch_size=batch_size)
 # model = VisionTransformer.load_from_checkpoint("lightning_logs/version_39/checkpoints/lowest_train_loss_hsi.ckpt")
 
 # model = DiffVisionTransformer(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, batch_size=batch_size)
 
-model = SWINTransformer(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, batch_size=batch_size)
+# model = SWINTransformer(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, batch_size=batch_size)
 
 
 # sys.exit()
