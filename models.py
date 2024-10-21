@@ -22,13 +22,13 @@ from torchvision.transforms import Resize
 import tifffile as tiff
 import os
 import sys
-from crfrnn import CrfRnn
+# from crfrnn import CrfRnn
 
 from scipy.ndimage import distance_transform_edt
-from rotary import RotaryEmbedding
-from rotary import apply_rotary_emb
-from local_attention import LocalAttention
-from flash_attn import flash_attn_func
+# from rotary import RotaryEmbedding
+# from rotary import apply_rotary_emb
+# from local_attention import LocalAttention
+# from flash_attn import flash_attn_func
 from transformers import Swinv2Config, Swinv2Model, UperNetConfig, UperNetForSemanticSegmentation
 from transformers import ConvNextConfig, Swinv2Config, ConvNextV2Config, SwinConfig
 #  pip install local-attention

@@ -40,7 +40,7 @@ from torchvision.transforms import Resize
 
 # tensorboard --logdir=./lightning_logs/
 # ctrl shft p -> Python: Launch Tensorboard  select lightning logs
-   
+
    
 def extract_rgb(cube, red_layer=70 , green_layer=53, blue_layer=19):
 
@@ -121,6 +121,7 @@ class LIBHSIDataset(Dataset):
         self.img_names = [f for f in os.listdir(self.img_dir) if f.endswith('.' + 'dat')]
         self.num_images = len( self.img_names  ) 
 
+        # print("Number of images in the dataset: ", self.num_images, "label_dir len: ", len(os.listdir(self.label_dir)))
         assert self.num_images == len(os.listdir(self.label_dir))
         
         self.img_labels = [f for f in os.listdir(self.label_dir)]
@@ -303,7 +304,7 @@ def compute_dataset_statistics(dataset, num_channels):
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=models.collate_fn,num_workers=8)
 
     for batch in dataloader:
-        images = batch['msi_pixel_values']  # Assuming the dataset returns a dictionary with 'image' key
+        images = batch['hsi_pixel_values']  # Assuming the dataset returns a dictionary with 'image' key
         images = images.view(images.size(0), images.size(1), -1)  # Flatten the spatial dimensions
         pixel_count += images.size(2)
 
@@ -340,20 +341,20 @@ num_classes = len(id2label)
 # num_classes = 10 # ignore 0 background 
 num_classes = len(id2label)
 
-batch_size = 16
+batch_size = 8
 # ignore_index=0 # background
 ignore_index=7 # misc. class, 
 
 
 num_workers = 4 #  os.cpu_count() or 1  # Fallback to 1 if os.cpu_count() is None
-initial_lr =  10e-4  # .001 for smp, 3e-4 for transformer
+initial_lr =  1e-3  # .001 for smp, 3e-4 for transformer
 swa_lr = 0.01
 # these should be multiple of 14 for dino model 
 # input image is of size 256x256
-img_height = 256
-img_width = 256
-max_num_epochs = 100
-accumulate_grad_batches = 1 # increases the effective batch size  # 1 means no accumulation # more important when batch size is small or not doing multi gpu training
+img_height = 512#256
+img_width = 512#256
+max_num_epochs = 1000
+accumulate_grad_batches = 4 # increases the effective batch size  # 1 means no accumulation # more important when batch size is small or not doing multi gpu training
 grad_clip_val = 5 # clip gradients that have norm bigger than tmax_val)his
 training_model = True
 tuning_model = False
@@ -362,7 +363,8 @@ test_model = False
 
 # Define mean and standard deviation for normalization
 # Use the same value for all channels
-num_channels = 14
+# num_channels = 14
+num_channels = 204
 # mean = [0.45] * num_channels  
 # std = [0.225] * num_channels   
 
@@ -393,8 +395,8 @@ torch.cuda.empty_cache()
 
 test_transform = A.Compose([
     A.Resize(width=img_width, height=img_height), 
-    A.Normalize(normalization="image_per_channel", max_pixel_value=255.0)
-], additional_targets={"msi_image": "image"})
+    A.Normalize(normalization="image", max_pixel_value=255.0)
+], additional_targets={"hsi_image": "image"})
 
 train_transform = A.Compose([
     A.HorizontalFlip(p=0.5),
@@ -406,8 +408,9 @@ train_transform = A.Compose([
     A.ElasticTransform(alpha=1, sigma=50, alpha_affine=None, p=0.5),  # Set alpha_affine to None
     A.Resize(width=img_width, height=img_height), 
     # A.Normalize(mean=mean, std=std, normalization="image", max_pixel_value=15032)
-    A.Normalize(normalization="image", max_pixel_value=255.0)
-], additional_targets={"msi_image": "image"})
+    A.Normalize(normalization="image", max_pixel_value=255.0),
+    A.ChannelDropout(channel_drop_range=(1, 2), fill_value=0, p=0.5)
+], additional_targets={"hsi_image": "image"})
 
 
 # train_dataset = mmsegyrebDataset(image_set="train", root_dir=dataset_dir,  transform=train_transform)
@@ -417,7 +420,7 @@ test_dataset = LIBHSIDataset(image_set="test", root_dir=dataset_dir, id2color=id
 val_dataset = LIBHSIDataset(image_set="validation", root_dir=dataset_dir, id2color=id2color, transform=test_transform)
 
 
-# channel_min, channel_max, channel_mean, channel_std = compute_dataset_statistics(train_dataset, num_channels)
+# channel_min, channel_max, channel_mean, channel_std = compute_dataset_statistics(test_dataset, num_channels)
 
 # print("Channel Min:", channel_min)
 # print("Channel Max:", channel_max)
@@ -442,7 +445,7 @@ model = SMP_SemanticSegmentation(num_classes=num_classes,learning_rate=initial_l
 
 # sys.exit()
 
-checkpoint_callback_train_loss = ModelCheckpoint(monitor="train_loss", mode="min", save_top_k=1, filename="lowest_train_loss_hsi")
+checkpoint_callback_val_loss = ModelCheckpoint(monitor="val_loss", mode="min", save_top_k=1, filename="lowest_val_loss_hsi")
 # checkpoint_callback_train_miou = ModelCheckpoint(monitor="train_miou", mode="max", save_top_k=1, filename="best_train_miou_hsi")
 # checkpoint_callback_last_epoch = ModelCheckpoint(monitor="epoch", mode="max", save_top_k=1, filename="last_epoch_hsi")
 
@@ -453,8 +456,8 @@ trainer = L.Trainer(
     max_epochs=max_num_epochs, 
     accumulate_grad_batches=accumulate_grad_batches, 
     callbacks=[
-        EarlyStopping(monitor="train_loss", mode="min", verbose=True, patience=15), 
-        checkpoint_callback_train_loss, StochasticWeightAveraging(swa_lrs=swa_lr) ], 
+        EarlyStopping(monitor="val_loss", mode="min", verbose=True, patience=15), 
+        checkpoint_callback_val_loss, StochasticWeightAveraging(swa_lrs=swa_lr) ], 
     accelerator="gpu", 
     devices="auto", 
     # gradient_clip_val=grad_clip_val, 
