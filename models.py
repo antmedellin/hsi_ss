@@ -949,7 +949,7 @@ class FPN_fuse(nn.Module):
         
 class VisionTransformer(BaseSegmentationModel):
         
-    def __init__(self, num_classes, learning_rate=1e-3, ignore_index=0, num_channels=12, num_workers=4, train_dataset=None, val_dataset=None, test_dataset=None, batch_size=2, embed_dim=512, hidden_dim=1024, num_heads=16, num_layers=8, patch_size=8, dropout=0.2, num_registers=4):
+    def __init__(self, num_classes, learning_rate=1e-3, ignore_index=0, num_channels=12, num_workers=4, train_dataset=None, val_dataset=None, test_dataset=None, batch_size=2, embed_dim=512, hidden_dim=1024, num_heads=16, num_layers=8, patch_size=8, dropout=0.2, num_registers=4, image_size=256):
 
         """Vision Transformer.
 
@@ -990,7 +990,7 @@ class VisionTransformer(BaseSegmentationModel):
         
         self.patch_size = patch_size
         self.num_registers = num_registers
-        num_patches = (256 // patch_size) ** 2 # 256 is the image size
+        num_patches = (image_size // patch_size) ** 2 # 256 is the image size #512
         self.num_patches = num_patches
 
         # Layers/Networks
@@ -1009,8 +1009,8 @@ class VisionTransformer(BaseSegmentationModel):
         
         # upernet  
         #backbone is the transformer encoder 
-        self.ppn = PSPModule(embed_dim)
-        self.FPN = FPN_fuse(feature_channels=[embed_dim, embed_dim, embed_dim, embed_dim], fpn_out=embed_dim)
+        # self.ppn = PSPModule(embed_dim)
+        # self.FPN = FPN_fuse(feature_channels=[embed_dim, embed_dim, embed_dim, embed_dim], fpn_out=embed_dim)
         self.segmentation_head = nn.Conv2d(embed_dim, self.num_classes , kernel_size=1)
         
         # original segmentation head
@@ -1056,11 +1056,11 @@ class VisionTransformer(BaseSegmentationModel):
         x = x.view(B, embed_dim, height, width)  # Reshape to [batch_size, embedding_dim, height, width]
 
         
-        # Apply PSPModule
-        x = self.ppn(x)
+        # # Apply PSPModule
+        # x = self.ppn(x)
 
-        # Apply FPN_fuse
-        x = self.FPN([x, x, x, x])  # Assuming the same feature map for simplicity
+        # # Apply FPN_fuse
+        # x = self.FPN([x, x, x, x])  # Assuming the same feature map for simplicity
 
             
         # print("x shape prime", x.shape)

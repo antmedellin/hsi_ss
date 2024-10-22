@@ -341,7 +341,7 @@ num_classes = len(id2label)
 # num_classes = 10 # ignore 0 background 
 num_classes = len(id2label)
 
-batch_size = 8
+batch_size = 16
 # ignore_index=0 # background
 ignore_index=7 # misc. class, 
 
@@ -351,10 +351,10 @@ initial_lr =  1e-3  # .001 for smp, 3e-4 for transformer
 swa_lr = 0.01
 # these should be multiple of 14 for dino model 
 # input image is of size 256x256
-img_height = 512#256
-img_width = 512#256
+img_height = 512  #512
+img_width = 512
 max_num_epochs = 1000
-accumulate_grad_batches = 4 # increases the effective batch size  # 1 means no accumulation # more important when batch size is small or not doing multi gpu training
+accumulate_grad_batches = 2 # increases the effective batch size  # 1 means no accumulation # more important when batch size is small or not doing multi gpu training
 grad_clip_val = 5 # clip gradients that have norm bigger than tmax_val)his
 training_model = True
 tuning_model = False
@@ -435,7 +435,9 @@ model = SMP_SemanticSegmentation(num_classes=num_classes,learning_rate=initial_l
 # model = SMP_Channel_SemanticSegmentation(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, batch_size=batch_size)
 # model = SMP_SemanticSegmentation.load_from_checkpoint("lightning_logs/version_19/checkpoints/lowest_train_loss_hsi.ckpt")
 
-# model = VisionTransformer(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, batch_size=batch_size)
+# model = VisionTransformer(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset,val_dataset=val_dataset, test_dataset=test_dataset, batch_size=batch_size, image_size=img_height)
+
+
 # model = VisionTransformer.load_from_checkpoint("lightning_logs/version_39/checkpoints/lowest_train_loss_hsi.ckpt")
 
 # model = DiffVisionTransformer(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, batch_size=batch_size)

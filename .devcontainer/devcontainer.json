@@ -1,5 +1,7 @@
 {
 
+  // docker compose run --service-ports --rm app /bin/bash
+
     // "image" : "hsi_ss",
     "image" : "dino2_docker",
 
