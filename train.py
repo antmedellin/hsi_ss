@@ -34,8 +34,8 @@ builtins.print = functools.partial(print, flush=True)
 import segmentation_models_pytorch as smp
 from segmentation_models_pytorch.losses import JaccardLoss
 import models
-from models import SMP_SemanticSegmentation, DINOv2_SemanticSegmentation, SMP_Channel_SemanticSegmentation, VisionTransformer, DiffVisionTransformer, SWINTransformer
-import tifffile as tiff
+from models import SMP_SemanticSegmentation, DINOv2_SemanticSegmentation, SMP_Channel_SemanticSegmentation, VisionTransformer, DiffVisionTransformer, SWINTransformer,Pretrained_models
+# import tifffile as tiff
 from torchvision.transforms import Resize
 
 # tensorboard --logdir=./lightning_logs/
@@ -341,7 +341,7 @@ num_classes = len(id2label)
 # num_classes = 10 # ignore 0 background 
 num_classes = len(id2label)
 
-batch_size = 16
+batch_size = 4
 # ignore_index=0 # background
 ignore_index=7 # misc. class, 
 
@@ -352,9 +352,9 @@ swa_lr = 0.01
 # these should be multiple of 14 for dino model 
 # input image is of size 256x256
 img_height = 512  #512
-img_width = 512
+img_width = 512  #256
 max_num_epochs = 1000
-accumulate_grad_batches = 2 # increases the effective batch size  # 1 means no accumulation # more important when batch size is small or not doing multi gpu training
+accumulate_grad_batches = 8 # increases the effective batch size  # 1 means no accumulation # more important when batch size is small or not doing multi gpu training
 grad_clip_val = 5 # clip gradients that have norm bigger than tmax_val)his
 training_model = True
 tuning_model = False
@@ -405,9 +405,8 @@ train_transform = A.Compose([
     A.GaussianBlur(blur_limit=(3, 7), p=0.5),
     A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.5),
     A.RandomScale(scale_limit=0.2, p=0.5),
-    A.ElasticTransform(alpha=1, sigma=50, alpha_affine=None, p=0.5),  # Set alpha_affine to None
+    A.ElasticTransform(alpha=1, sigma=50, p=0.5),  # Set alpha_affine to None
     A.Resize(width=img_width, height=img_height), 
-    # A.Normalize(mean=mean, std=std, normalization="image", max_pixel_value=15032)
     A.Normalize(normalization="image", max_pixel_value=255.0),
     A.ChannelDropout(channel_drop_range=(1, 2), fill_value=0, p=0.5)
 ], additional_targets={"hsi_image": "image"})
@@ -428,7 +427,7 @@ val_dataset = LIBHSIDataset(image_set="validation", root_dir=dataset_dir, id2col
 # print("Channel Std:", channel_std)
 # sys.exit()
 
-model = SMP_SemanticSegmentation(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, val_dataset=val_dataset, test_dataset=test_dataset, batch_size=batch_size)
+# model = SMP_SemanticSegmentation(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, val_dataset=val_dataset, test_dataset=test_dataset, batch_size=batch_size)
 
 
 # model = DINOv2_SemanticSegmentation(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset,  batch_size=batch_size)
@@ -442,8 +441,9 @@ model = SMP_SemanticSegmentation(num_classes=num_classes,learning_rate=initial_l
 
 # model = DiffVisionTransformer(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, batch_size=batch_size)
 
-# model = SWINTransformer(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, batch_size=batch_size)
+# model = SWINTransformer(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset,val_dataset=val_dataset, test_dataset=test_dataset, batch_size=batch_size, image_size=img_height)
 
+model = Pretrained_models(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset,val_dataset=val_dataset, test_dataset=test_dataset, batch_size=batch_size, image_size=img_height)
 
 # sys.exit()
 
@@ -462,8 +462,8 @@ trainer = L.Trainer(
         checkpoint_callback_val_loss, StochasticWeightAveraging(swa_lrs=swa_lr) ], 
     accelerator="gpu", 
     devices="auto", 
-    # gradient_clip_val=grad_clip_val, 
-    precision="16-mixed" ) 
+    gradient_clip_val=grad_clip_val, 
+    precision="16-mixed" ) # 
 
 if training_model == True: 
     
@@ -498,16 +498,11 @@ if test_model:
     # make sure to resize the images to the original size before saving the results (256x256)
     # save the predicted results as tiff files without compression and have the same name as the original image
 
-    model = SMP_SemanticSegmentation.load_from_checkpoint("lightning_logs/version_14/checkpoints/lowest_train_loss_hsi.ckpt")
-    test_dataset = mmsegyrebDataset(image_set="test", root_dir=dataset_dir,  transform=test_transform)
-    results_dir = "submitted_results/submission3/results"
-    model.results_dir = results_dir
+    model = Pretrained_models.load_from_checkpoint("lightning_logs/version_103/checkpoints/lowest_val_loss_hsi.ckpt")
 
-    os.makedirs(results_dir, exist_ok=True)
-    test_loader = DataLoader( test_dataset, shuffle=False, collate_fn=models.collate_fn,num_workers=16, batch_size =16)
     model.eval()
 
-    trainer.test(model, dataloaders=test_loader)
+    trainer.test(model)
 
-    print("Test set processed and results saved.")
-    # you can now zip the folder with zip_files.py file
+    print("Done")
+    

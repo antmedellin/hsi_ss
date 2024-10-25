@@ -1,4 +1,4 @@
-# build command  docker build -t dino2_docker .  
+# build command  docker build -t dino2_docker -f Dockerfile_dino .  
 
 # FROM nvidia/cuda:12.5.0-devel-ubuntu22.04
 FROM nvidia/cuda:12.2.2-devel-ubuntu22.04
@@ -18,7 +18,9 @@ RUN apt install -y \
     pip \
     sudo \
     g++ \
-    ca-certificates
+    ca-certificates \
+    htop \
+    nano
 
 
 RUN pip install \

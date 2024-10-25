@@ -19,7 +19,7 @@ import numpy as np
 from matplotlib.colors import ListedColormap, BoundaryNorm
 from segmentation_models_pytorch.losses import FocalLoss, LovaszLoss, DiceLoss, SoftCrossEntropyLoss
 from torchvision.transforms import Resize
-import tifffile as tiff
+# import tifffile as tiff
 import os
 import sys
 # from crfrnn import CrfRnn
@@ -349,15 +349,15 @@ class BaseSegmentationModel(L.LightningModule):
               
         def train_dataloader(self):
             
-            return  DataLoader(self.train_dataset, batch_size=self.hparams.batch_size, shuffle=True, collate_fn=collate_fn,num_workers=self.num_workers)
+            return  DataLoader(self.train_dataset, batch_size=self.hparams.batch_size, shuffle=True, collate_fn=collate_fn,num_workers=self.num_workers, drop_last=True)
         
         def val_dataloader(self):
             
-            return  DataLoader(self.val_dataset, batch_size=self.hparams.batch_size, shuffle=False, collate_fn=collate_fn,num_workers=self.num_workers)
+            return  DataLoader(self.val_dataset, batch_size=self.hparams.batch_size, shuffle=False, collate_fn=collate_fn,num_workers=self.num_workers, drop_last=True)
         
         def test_dataloader(self):
             
-            return  DataLoader(self.test_dataset, batch_size=self.hparams.batch_size, shuffle=False, collate_fn=collate_fn,num_workers=self.num_workers)
+            return  DataLoader(self.test_dataset, batch_size=self.hparams.batch_size, shuffle=False, collate_fn=collate_fn,num_workers=self.num_workers, drop_last=True)
 
 class SMP_SemanticSegmentation(BaseSegmentationModel):
     def __init__(self, num_classes, learning_rate=1e-3, ignore_index=0, num_channels=12, num_workers=4, train_dataset=None, val_dataset=None, test_dataset=None, batch_size=2):
@@ -1075,7 +1075,7 @@ class VisionTransformer(BaseSegmentationModel):
     
 class SWINTransformer(BaseSegmentationModel):
         
-    def __init__(self, num_classes, learning_rate=1e-3, ignore_index=0, num_channels=12, num_workers=4, train_dataset=None, val_dataset=None, test_dataset=None, batch_size=2, embed_dim=192, patch_size=8, dropout=0.2, num_registers=4):
+    def __init__(self, num_classes, learning_rate=1e-3, ignore_index=0, num_channels=12, num_workers=4, train_dataset=None, val_dataset=None, test_dataset=None, batch_size=2, embed_dim=192, patch_size=8, dropout=0.2, num_registers=4, image_size=256):
 
    
         super().__init__(num_classes, learning_rate, ignore_index, num_channels, num_workers, train_dataset, val_dataset, test_dataset, batch_size)
@@ -1084,60 +1084,65 @@ class SWINTransformer(BaseSegmentationModel):
         
         self.patch_size = patch_size
         self.num_registers = num_registers
-        num_patches = (256 // patch_size) ** 2 # 256 is the image size
+        num_patches = (image_size // patch_size) ** 2 # 256 is the image size
         self.num_patches = num_patches
 
         # SWIN Transformer 
         # compare the perfromance of swin vs convnextv2
-        # backbone_configuration = ConvNextV2Config(num_channels=num_channels, patch_size=patch_size, image_size=256, embed_dim=embed_dim, hidden_dropout_prob= dropout, attention_probs_dropout_prob=dropout, out_features=["stage1", "stage2", "stage3", "stage4"])
-        # seg_head = UperNetConfig(backbone_config=backbone_configuration, num_labels = num_classes)
-        # self.swin_upernet = UperNetForSemanticSegmentation(seg_head)
+        # paper recommend 1e-4 learning rate
         
-        # backbone_configuration = Swinv2Config(num_channels=num_channels, patch_size=patch_size, image_size=256, embed_dim=embed_dim, hidden_dropout_prob= dropout, attention_probs_dropout_prob=dropout, out_features=["stage1", "stage2", "stage3", "stage4"])
+        # Model type should be one of BeitConfig, BitConfig, ConvNextConfig, ConvNextV2Config, DinatConfig, Dinov2Config, FocalNetConfig, HieraConfig, MaskFormerSwinConfig, NatConfig, PvtV2Config, ResNetConfig, RTDetrResNetConfig, SwinConfig, Swinv2Config, TimmBackboneConfig, VitDetConfig.
         
-        # self.model = Swinv2Model(backbone_configuration)
-    
-        backbone_configuration = Swinv2Config(
-            embed_dim=192,
-            depths=[2, 2, 18, 2],
-            num_heads=[6, 12, 24, 48],
-            window_size=12,
-            ape=False,
-            drop_path_rate=0.3,
-            patch_norm=True,
-            use_checkpoint=False,
-            num_channels=num_channels,
-            patch_size=patch_size,
-            image_size=256,
-            hidden_dropout_prob=dropout,
-            attention_probs_dropout_prob=dropout,
+        from transformers import DeiTConfig, BitConfig, ResNetConfig
+        # backbone_configuration = ConvNextV2Config(num_channels=num_channels, patch_size=patch_size, image_size=image_size, hidden_dropout_prob= dropout, attention_probs_dropout_prob=dropout, out_features=[ "stage1","stage2", "stage3", "stage4"])
+        
+        
+        backbone_configuration = ConvNextV2Config(
+            num_channels=num_channels, 
+            image_size=image_size,
+            patch_size=patch_size, 
             out_features=["stage1", "stage2", "stage3", "stage4"]
-        )
-
-        # Define the segmentation head configuration
-        seg_head = UperNetConfig(
-            backbone_config=backbone_configuration,
-            num_labels=num_classes,
-            decode_head=dict(
-                in_channels=[192, 384, 768, 1536],
-                num_classes=num_classes,
-                loss_decode=dict(
-                    type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0,
-                    class_weight=[0.5, 1.31237, 1.38874, 1.39761, 1.5, 1.47807]
-                )
-            ),
-            auxiliary_head=dict(
-                in_channels=768,
-                num_classes=num_classes,
-                loss_decode=dict(
-                    type='CrossEntropyLoss', use_sigmoid=False, loss_weight=0.4,
-                    class_weight=[0.5, 1.31237, 1.38874, 1.39761, 1.5, 1.47807]
-                )
             )
+        
+        seg_head = UperNetConfig(
+            backbone_config=backbone_configuration, 
+            num_labels = num_classes,                 
         )
-
-        # Initialize the model
-        self.model = UperNetForSemanticSegmentation(seg_head)
+        
+        
+        # backbone_configuration = Swinv2Config(
+        #     num_channels=num_channels, 
+        #     image_size=image_size,
+        #     patch_size=patch_size, 
+        #     # drop_path_rate=dropout, 
+        #     out_features=["stage1", "stage2", "stage3", "stage4"]
+        #     )
+        
+        # seg_head = UperNetConfig(
+        #     backbone_config=backbone_configuration, 
+        #     num_labels = num_classes,      
+        #     auxiliary_in_channels=1024,
+        #     auxiliary_concat_input=True,         
+        # )
+        
+        
+        
+        # backbone_configuration = Swinv2Config(
+        #     num_channels=num_channels, 
+        #     image_size=image_size,
+        #     patch_size=patch_size, 
+        #     # drop_path_rate=dropout, 
+        #     out_features=["stage1", "stage2", "stage3", "stage4"]
+        #     )
+        # seg_head = UperNetConfig(
+        #     backbone_config=backbone_configuration, 
+        #     num_labels = num_classes,               
+        # )
+        
+        
+        
+                                 
+        self.swin_upernet = UperNetForSemanticSegmentation(seg_head)
         
         
         # print(self.swin_upernet.config)
@@ -1147,12 +1152,124 @@ class SWINTransformer(BaseSegmentationModel):
     def forward(self, msi_img, sar_img):
          
         # print("msi_img shape", msi_img.shape)
-        # outputs = self.swin_upernet(msi_img)
+        outputs = self.swin_upernet(msi_img)
+        
+        # outputs = self.model(msi_img)
+        
+        x = outputs
+        
+        # print("x shape", x.shape)
+
+        return x.logits
+    
+    
+class Pretrained_models(BaseSegmentationModel):
+        
+    def __init__(self, num_classes, learning_rate=1e-3, ignore_index=0, num_channels=12, num_workers=4, train_dataset=None, val_dataset=None, test_dataset=None, batch_size=2, embed_dim=192, patch_size=8, dropout=0.2, num_registers=4, image_size=256):
+
+   
+        super().__init__(num_classes, learning_rate, ignore_index, num_channels, num_workers, train_dataset, val_dataset, test_dataset, batch_size)
+
+        # embed dim 192, hidden is 1536
+        
+        self.patch_size = patch_size
+        self.num_registers = num_registers
+        num_patches = (image_size // patch_size) ** 2 # 256 is the image size
+        self.num_patches = num_patches
+
+        # SWIN Transformer 
+        # compare the perfromance of swin vs convnextv2
+        # paper recommend 1e-4 learning rate
+        
+        # Model type should be one of BeitConfig, BitConfig, ConvNextConfig, ConvNextV2Config, DinatConfig, Dinov2Config, FocalNetConfig, HieraConfig, MaskFormerSwinConfig, NatConfig, PvtV2Config, ResNetConfig, RTDetrResNetConfig, SwinConfig, Swinv2Config, TimmBackboneConfig, VitDetConfig.
+        
+        # from transformers import DeiTConfig, BitConfig, ResNetConfig
+        # import timm 
+        
+        
+        # pretrained_model = timm.create_model('convnextv2_base.fcmae_ft_in22k_in1k', pretrained=True, num_classes=num_classes)
+        
+        
+        # # Extract the original weights from the first convolutional layer
+        # original_conv_weights = pretrained_model.stem[0].weight.data
+
+        # # Compute the average across the channel dimension
+        # averaged_weights = original_conv_weights.mean(dim=1, keepdim=True)
+
+        # # Repeat the averaged weights to match the new number of input channels
+        # new_conv_weights = averaged_weights.repeat(1, num_channels, 1, 1)
+
+
+        # # Modify the stem to accept num_channels instead of 3
+        # pretrained_model.stem = nn.Sequential(
+        #     nn.Conv2d(num_channels, 128, kernel_size=(4, 4), stride=(4, 4)),
+        #     nn.LayerNorm([128, 128, 128], eps=1e-06, elementwise_affine=True)
+        # )
+
+        # # Initialize the new convolutional layer with the averaged weights
+        # pretrained_model.stem[0].weight.data = new_conv_weights
+        
+        # data_config = timm.data.resolve_data_config(model=pretrained_model)
+        
+        # # Remove the existing head
+        # pretrained_model.head = nn.Identity()
+        
+        
+        # print(pretrained_model)
+        # print(data_config)
+        
+        
+        # seg_head = UperNetConfig(
+        #     backbone_config=data_config, 
+        #     num_labels = num_classes,                 
+        # )
+                                 
+        # self.model = UperNetForSemanticSegmentation(seg_head)
+        
+        
+        # print(self.model.config)
+        self.model = UperNetForSemanticSegmentation.from_pretrained("openmmlab/upernet-convnext-large", num_labels=num_classes, ignore_mismatched_sizes=True)
+        # print(self.model)
+        
+        # Modify the first convolutional layer to accept num_channels instead of 3
+        original_conv_weights = self.model.backbone.embeddings.patch_embeddings.weight.data
+        averaged_weights = original_conv_weights.mean(dim=1, keepdim=True)
+        new_conv_weights = averaged_weights.repeat(1, num_channels, 1, 1)
+        
+        # Tiny model is 96, large is 192
+        self.model.backbone.embeddings.patch_embeddings = nn.Conv2d(num_channels, 192, kernel_size=(4, 4), stride=(4, 4))
+        self.model.backbone.embeddings.patch_embeddings.weight.data = new_conv_weights
+        self.model.backbone.embeddings.num_channels = num_channels
+        # print(self.model.backbone.embeddings.num_channels )
+        
+        
+        # print(self.model)
+        
+        # image size 224
+        self.model.config.loss_ignore_index = ignore_index
+        # Update the model configuration to reflect the new number of input channels
+        self.model.config.backbone_config.num_channels = num_channels
+        self.model.config.num_channels = num_channels
+        
+        # print(self.model.config.backbone_config.num_channels)
+        # Print the expected input size
+        # print(self.model.config.backbone_config.num_channels )
+        
+        # print(self.model.config)
+
+        
+       
+    def forward(self, msi_img, sar_img):
+         
+        # Print the number of channels and the shape of the input image
+        # print(f"Expected num_channels: {self.model.config.backbone_config.num_channels}")
+        # print(f"Input image shape: {msi_img.shape}")
+        
         
         outputs = self.model(msi_img)
         
         x = outputs
         
-        print("x shape", x.shape)
+        # print("x shape", x.logits.shape)
 
         return x.logits
