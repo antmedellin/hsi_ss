@@ -34,7 +34,7 @@ builtins.print = functools.partial(print, flush=True)
 import segmentation_models_pytorch as smp
 from segmentation_models_pytorch.losses import JaccardLoss
 import models
-from models import SMP_SemanticSegmentation, DINOv2_SemanticSegmentation, SMP_Channel_SemanticSegmentation, VisionTransformer, DiffVisionTransformer, SWINTransformer,Pretrained_models
+from models import SMP_SemanticSegmentation, DINOv2_SemanticSegmentation, SMP_Channel_SemanticSegmentation, VisionTransformer, DiffVisionTransformer, SWINTransformer,Pretrained_models, Pretrained_backbone_uperhead
 # import tifffile as tiff
 from torchvision.transforms import Resize
 
@@ -345,7 +345,6 @@ batch_size = 4
 # ignore_index=0 # background
 ignore_index=7 # misc. class, 
 
-
 num_workers = 4 #  os.cpu_count() or 1  # Fallback to 1 if os.cpu_count() is None
 initial_lr =  1e-3  # .001 for smp, 3e-4 for transformer
 swa_lr = 0.01
@@ -368,6 +367,33 @@ num_channels = 204
 # mean = [0.45] * num_channels  
 # std = [0.225] * num_channels   
 
+pretrained_mean = [0.485, 0.456, 0.406]
+pretrained_std = [0.229, 0.224, 0.225]
+img_height = 224
+img_width = 224
+
+torch.cuda.empty_cache()
+
+test_transform = A.Compose([
+    A.Resize(width=img_width, height=img_height), 
+    # A.Normalize(normalization="image", max_pixel_value=255.0)
+    A.Normalize(mean=pretrained_mean, std=pretrained_std, max_pixel_value=255.0),
+], additional_targets={"hsi_image": "image"})
+
+train_transform = A.Compose([
+    A.HorizontalFlip(p=0.5),
+    A.VerticalFlip(p=0.5),
+    A.RandomRotate90(p=0.5),
+    A.GaussianBlur(blur_limit=(3, 7), p=0.5),
+    A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.5),
+    A.RandomScale(scale_limit=0.2, p=0.5),
+    A.ElasticTransform(alpha=1, sigma=50, p=0.5),  # Set alpha_affine to None
+    A.Resize(width=img_width, height=img_height), 
+    # A.Normalize(normalization="image", max_pixel_value=255.0),
+    A.Normalize(mean=pretrained_mean, std=pretrained_std, max_pixel_value=255.0),
+    A.ChannelDropout(channel_drop_range=(1, 2), fill_value=0, p=0.5)
+], additional_targets={"hsi_image": "image"})
+
 
 # mean = [1368.6125, 1159.3759, 1066.2174, 1000.4777, 1233.8301, 1868.6222, 2124.8076, 2111.7993, 2322.8552, 1078.5980, 1715.7476, 1081.0111, -1487.6545, -803.5430]
 # std = [491.7540, 544.0209, 557.4269, 675.8509, 660.5626, 602.1366, 635.2303, 644.9349, 678.6457, 557.9268, 665.9048, 528.2560, 430.0971, 362.5961]
@@ -388,28 +414,6 @@ num_channels = 204
 
 # Channel Std: tensor([491.7540, 544.0209, 557.4269, 675.8509, 660.5626, 602.1366, 635.2303,
 #         644.9349, 678.6457, 557.9268, 665.9048, 528.2560, 430.0971, 362.5961])
-
-
-
-torch.cuda.empty_cache()
-
-test_transform = A.Compose([
-    A.Resize(width=img_width, height=img_height), 
-    A.Normalize(normalization="image", max_pixel_value=255.0)
-], additional_targets={"hsi_image": "image"})
-
-train_transform = A.Compose([
-    A.HorizontalFlip(p=0.5),
-    A.VerticalFlip(p=0.5),
-    A.RandomRotate90(p=0.5),
-    A.GaussianBlur(blur_limit=(3, 7), p=0.5),
-    A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.5),
-    A.RandomScale(scale_limit=0.2, p=0.5),
-    A.ElasticTransform(alpha=1, sigma=50, p=0.5),  # Set alpha_affine to None
-    A.Resize(width=img_width, height=img_height), 
-    A.Normalize(normalization="image", max_pixel_value=255.0),
-    A.ChannelDropout(channel_drop_range=(1, 2), fill_value=0, p=0.5)
-], additional_targets={"hsi_image": "image"})
 
 
 # train_dataset = mmsegyrebDataset(image_set="train", root_dir=dataset_dir,  transform=train_transform)
@@ -443,7 +447,31 @@ val_dataset = LIBHSIDataset(image_set="validation", root_dir=dataset_dir, id2col
 
 # model = SWINTransformer(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset,val_dataset=val_dataset, test_dataset=test_dataset, batch_size=batch_size, image_size=img_height)
 
-model = Pretrained_models(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset,val_dataset=val_dataset, test_dataset=test_dataset, batch_size=batch_size, image_size=img_height)
+# model = Pretrained_models(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset,val_dataset=val_dataset, test_dataset=test_dataset, batch_size=batch_size, image_size=img_height)
+
+
+model = Pretrained_backbone_uperhead(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset,val_dataset=val_dataset, test_dataset=test_dataset, batch_size=batch_size, image_size=img_height)
+
+
+# sudo apt-get install graphviz -y
+# pip install torchviz
+# from torchviz import make_dot  
+# Create a sample input tensor with the appropriate shape
+# Adjust the shape according to your model's expected input
+sample_msi_img = torch.randn(8, num_channels, img_height, img_height)  # Example shape
+sample_rgb_img = torch.randn(8, 3, img_height, img_height)  # Example shape for RGB image
+
+
+# print(train_dataset[0])
+# sample_msi_img = train_dataset[0][0].unsqueeze(0)
+# sample_rgb_img = train_dataset[0][1].unsqueeze(0)
+
+# # Pass the sample input through the model
+output = model.forward(sample_msi_img, sample_rgb_img)
+
+# # Visualize the computation graph
+# graph = make_dot(output, params=dict(model.named_parameters()))
+# graph.render("model_computation_graph", format="png")
 
 # sys.exit()
 
@@ -498,7 +526,7 @@ if test_model:
     # make sure to resize the images to the original size before saving the results (256x256)
     # save the predicted results as tiff files without compression and have the same name as the original image
 
-    model = Pretrained_models.load_from_checkpoint("lightning_logs/version_103/checkpoints/lowest_val_loss_hsi.ckpt")
+    model = Pretrained_backbone_uperhead.load_from_checkpoint("lightning_logs/version_112/checkpoints/lowest_val_loss_hsi.ckpt")
 
     model.eval()
 

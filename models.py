@@ -1228,48 +1228,126 @@ class Pretrained_models(BaseSegmentationModel):
         
         
         # print(self.model.config)
+        
+        
+        # self.model = UperNetForSemanticSegmentation.from_pretrained("openmmlab/upernet-swin-large", num_labels=num_classes, ignore_mismatched_sizes=True)
+        
+        
+        # self.model.backbone.embeddings.patch_embeddings.projection = nn.Conv2d(num_channels, 192, kernel_size=(4, 4), stride=(4, 4))
+        
+        # original_conv_weights = self.model.backbone.embeddings.patch_embeddings.projection.weight.data
+        # averaged_weights = original_conv_weights.mean(dim=1, keepdim=True)
+        # new_conv_weights = averaged_weights.repeat(1, num_channels, 1, 1)
+        # self.model.backbone.embeddings.patch_embeddings.projection.weight.data = new_conv_weights
+        # self.model.backbone.embeddings.num_channels = num_channels
+        
+        # print(self.model)
+        
         self.model = UperNetForSemanticSegmentation.from_pretrained("openmmlab/upernet-convnext-large", num_labels=num_classes, ignore_mismatched_sizes=True)
-        # print(self.model)
-        
-        # Modify the first convolutional layer to accept num_channels instead of 3
-        original_conv_weights = self.model.backbone.embeddings.patch_embeddings.weight.data
-        averaged_weights = original_conv_weights.mean(dim=1, keepdim=True)
-        new_conv_weights = averaged_weights.repeat(1, num_channels, 1, 1)
-        
-        # Tiny model is 96, large is 192
-        self.model.backbone.embeddings.patch_embeddings = nn.Conv2d(num_channels, 192, kernel_size=(4, 4), stride=(4, 4))
-        self.model.backbone.embeddings.patch_embeddings.weight.data = new_conv_weights
-        self.model.backbone.embeddings.num_channels = num_channels
-        # print(self.model.backbone.embeddings.num_channels )
-        
         
         # print(self.model)
         
-        # image size 224
+        # # Modify the first convolutional layer to accept num_channels instead of 3
+        # original_conv_weights = self.model.backbone.embeddings.patch_embeddings.weight.data
+        # averaged_weights = original_conv_weights.mean(dim=1, keepdim=True)
+        # new_conv_weights = averaged_weights.repeat(1, num_channels, 1, 1)
+        
+        # # Tiny model is 96, large is 192
+        # self.model.backbone.embeddings.patch_embeddings = nn.Conv2d(num_channels, 192, kernel_size=(4, 4), stride=(4, 4))
+        # self.model.backbone.embeddings.patch_embeddings.weight.data = new_conv_weights
+        # self.model.backbone.embeddings.num_channels = num_channels
+        # # print(self.model.backbone.embeddings.num_channels )
+        
+        
+        # # print(self.model)
+        
+        # # image size 224
         self.model.config.loss_ignore_index = ignore_index
-        # Update the model configuration to reflect the new number of input channels
-        self.model.config.backbone_config.num_channels = num_channels
-        self.model.config.num_channels = num_channels
+        # # Update the model configuration to reflect the new number of input channels
+        # self.model.config.backbone_config.num_channels = num_channels
+        # self.model.config.num_channels = num_channels
         
-        # print(self.model.config.backbone_config.num_channels)
-        # Print the expected input size
-        # print(self.model.config.backbone_config.num_channels )
+        # # print(self.model.config.backbone_config.num_channels)
+        # # Print the expected input size
+        # # print(self.model.config.backbone_config.num_channels )
         
-        # print(self.model.config)
+        # # print(self.model.config)
 
         
        
-    def forward(self, msi_img, sar_img):
+    def forward(self, msi_img, rgb_img):
          
         # Print the number of channels and the shape of the input image
         # print(f"Expected num_channels: {self.model.config.backbone_config.num_channels}")
         # print(f"Input image shape: {msi_img.shape}")
         
         
-        outputs = self.model(msi_img)
+        outputs = self.model(rgb_img)
         
         x = outputs
         
         # print("x shape", x.logits.shape)
 
         return x.logits
+    
+
+    
+class Pretrained_backbone_uperhead(BaseSegmentationModel):
+        
+    def __init__(self, num_classes, learning_rate=1e-3, ignore_index=0, num_channels=12, num_workers=4, train_dataset=None, val_dataset=None, test_dataset=None, batch_size=2, embed_dim=192, patch_size=8, dropout=0.2, num_registers=4, image_size=256):
+
+   
+        super().__init__(num_classes, learning_rate, ignore_index, num_channels, num_workers, train_dataset, val_dataset, test_dataset, batch_size)
+
+        import timm
+        
+        # pretrained_model = timm.create_model('convnextv2_large.fcmae_ft_in22k_in1k', pretrained=True)
+
+        # data_config = timm.data.resolve_model_data_config(pretrained_model)
+        # transforms = timm.data.create_transform(**data_config, is_training=False)
+        
+        # print(data_config)
+        # print(transforms)
+        
+        # self.model = UperNetForSemanticSegmentation.from_pretrained("openmmlab/upernet-swin-large", num_labels=num_classes, ignore_mismatched_sizes=True)
+        # new_backbone = timm.create_model('timm/swinv2_large_window12to16_192to256.ms_in22k_ft_in1k', pretrained=True, features_only=True)
+        
+        
+        # self.model = UperNetForSemanticSegmentation.from_pretrained("openmmlab/upernet-convnext-large", num_labels=num_classes, ignore_mismatched_sizes=True, loss_ignore_index= ignore_index)
+        # Load the new backbone
+        # new_backbone = timm.create_model('convnextv2_large.fcmae_ft_in22k_in1k', pretrained=True, features_only=True)
+        # self.model = UperNetForSemanticSegmentation.from_pretrained("convnextv2_large.fcmae_ft_in22k_in1k", num_labels=num_classes, ignore_mismatched_sizes=True, loss_ignore_index= ignore_index, use_timm_backbone=True)
+
+
+        # Replace the backbone in the UperNet model        
+        # self.model.backbone = new_backbone
+        
+        
+        model_config = UperNetConfig(use_pretrained_backbone=True, use_timm_backbone=True, backbone='convnextv2_large.fcmae_ft_in22k_in1k', loss_ignore_index= ignore_index,  num_labels=num_classes, use_auxiliary_head = False)
+        
+        # , out_features=["stage1", "stage2", "stage3", "stage4"] auxiliary_channels=768,
+        
+        # convnextv2_large.fcmae_ft_in22k_in1k
+        #  convnextv2_tiny.fcmae_ft_in22k_in1k
+                                     
+        self.model = UperNetForSemanticSegmentation(model_config)       
+        # print(self.model.config)       
+        
+          
+        
+        
+    def forward(self, msi_img, rgb_img):
+         
+        # Print the number of channels and the shape of the input image
+        # print(f"Expected num_channels: {self.model.config.backbone_config.num_channels}")
+        # print(f"Input image shape: {msi_img.shape}")
+        
+        
+        outputs = self.model(rgb_img)
+        
+        x = outputs
+        
+        # print("x shape", x.logits.shape)
+
+        return x.logits
+            
